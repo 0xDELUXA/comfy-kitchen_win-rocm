@@ -6,6 +6,9 @@
 #   Copyright (c) Meta Platforms, Inc. and affiliates.
 #   Licensed under the BSD 3-Clause License (see NOTICE file for details)
 
+import functools
+import os
+
 import torch
 
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
@@ -962,6 +965,37 @@ def dequantize_int8_simple_dtype(q: torch.Tensor, scale: torch.Tensor, output_dt
     return dequantize_int8_simple(q, scale).to(DTYPE_CODE_TO_DTYPE[output_dtype_code])
 
 
+# RDNA2 (gfx103x) is the one architecture with no INT8 GEMM at all: rocBLAS ships no
+# integer kernels, hipBLASLt does not support the arch, and the HIP backend declines
+# the WMMA GEMMs there, so torch._int_mm raises instead of running. Everywhere else
+# keeps the int8 path.
+_ARCH_NO_INT8_MM = ("gfx103",)
+
+
+def _use_int8_mm(device_type: str, device_index: int) -> bool:
+    mode = os.environ.get("COMFY_KITCHEN_INT8_EAGER", "auto").strip().lower()
+    if mode == "int_mm":
+        return True
+    if mode == "dequant":
+        return False
+    if mode == "auto":
+        return _use_int8_mm_auto(device_type, device_index)
+    raise ValueError("COMFY_KITCHEN_INT8_EAGER must be one of: auto, int_mm, dequant")
+
+
+@functools.cache
+def _use_int8_mm_auto(device_type: str, device_index: int) -> bool:
+    if device_type != "cuda" or getattr(torch.version, "hip", None) is None:
+        return True
+    try:
+        arch = torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
+    except Exception:
+        # A HIP device whose architecture cannot be read cannot be shown to have an
+        # INT8 GEMM, so take the fallback: slower, but it runs everywhere.
+        return False
+    return not arch.startswith(_ARCH_NO_INT8_MM)
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1010,6 +1044,17 @@ def int8_linear(
             )
         h = _build_hadamard(convrot_groupsize, device=x.device, dtype=x.dtype)
         x = _rotate_activation(x, h, convrot_groupsize)
+
+    # Archs without an INT8 GEMM backend (RDNA2): dequantize the weight and run a
+    # normal float GEMM instead. Weights stay stored as INT8, so the VRAM saving holds.
+    if not _use_int8_mm(x.device.type, x.device.index if x.device.index is not None else 0):
+        ws = weight_scale if weight_scale.numel() == 1 else weight_scale.reshape(-1, 1)
+        w = (weight.float() * ws).to(out_dtype)
+        return torch.nn.functional.linear(
+            x.to(out_dtype),
+            w,
+            None if bias is None else bias.to(device=x.device, dtype=out_dtype),
+        )
 
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
