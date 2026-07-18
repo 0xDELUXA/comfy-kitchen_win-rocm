@@ -748,9 +748,15 @@ def _round_up(value: int, alignment: int) -> int:
 def _int8_matmul_accumulate(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Multiply INT8 matrices and return INT32 accumulators."""
     def fast_int8_mm(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-        if hasattr(torch, "int8_mm"):
-            return torch.int8_mm(lhs, rhs)
-        return torch._int_mm(lhs, rhs)
+        try:
+            if hasattr(torch, "int8_mm"):
+                return torch.int8_mm(lhs, rhs)
+            return torch._int_mm(lhs, rhs)
+        except RuntimeError:
+            try:
+                return torch.matmul(lhs.to(torch.int32), rhs.to(torch.int32))
+            except RuntimeError:
+                return torch.matmul(lhs.to(torch.float32), rhs.to(torch.float32)).round().to(torch.int32)
 
     orig_m = a.size(0)
     orig_n = b.size(1)
@@ -821,8 +827,7 @@ def _round_int8(scaled: torch.Tensor, stochastic_rounding: int | None = 0) -> to
     if stochastic_rounding is not None and stochastic_rounding > 0:
         rng = _int8_stochastic_rng(scaled, stochastic_rounding)
         scaled.add_(rng)
-        return scaled.floor_().clamp_(-128.0, 127.0).to(torch.int8)
-    return scaled.round_().clamp_(-128.0, 127.0).to(torch.int8)
+    return scaled.floor_().clamp_(-128.0, 127.0).to(torch.int8) if stochastic_rounding else scaled.round_().clamp_(-128.0, 127.0).to(torch.int8)
 
 
 def quantize_int8_tensorwise(
