@@ -8,7 +8,7 @@ from torch.nn import functional
 
 import comfy_kitchen as ck
 from comfy_kitchen.tensor.int8_utils import _build_hadamard
-from tests.conftest import get_capable_backends
+from tests.conftest import cuda_backend_available, get_capable_backends
 
 _GROUP = 256
 
@@ -38,8 +38,8 @@ class TestInputActQuantizer:
         dtype before quantizing, while the fused path keeps float32 all the way
         to the int8 conversion.
         """
-        if not cuda_available:
-            pytest.skip("CUDA required")
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
         from comfy_kitchen.backends import cuda as cuda_backend
 
         h = torch.randn(shape, dtype=dtype, device="cuda") * 2.0

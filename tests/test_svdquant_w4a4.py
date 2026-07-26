@@ -32,7 +32,7 @@ from comfy_kitchen.tensor import (
     svdquant_w4a4_grouped_linear,
 )
 
-from .conftest import assert_values_close
+from .conftest import assert_values_close, cuda_backend_available
 
 _GROUP = 64
 _TILE_BN = 128
@@ -319,9 +319,9 @@ class TestActUnsignedDispatch:
     """
 
     @pytest.fixture
-    def _cuda_required(self, cuda_available):
-        if not cuda_available:
-            pytest.skip("CUDA required for int4 MMA kernels")
+    def _cuda_required(self):
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required for int4 MMA kernels")
 
     def _run(self, act_unsigned):
         m, n, k, r = 16, 8, 64, 16
@@ -371,8 +371,8 @@ class TestLoraXSeparation:
     @pytest.mark.parametrize("backend", ["eager", "cuda"])
     def test_lora_x_none_defaults_to_x(self, cuda_available, seed, backend):
         """Explicit lora_x=x is indistinguishable from lora_x=None (default)."""
-        if backend == "cuda" and not cuda_available:
-            pytest.skip("CUDA backend not available")
+        if backend == "cuda" and not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
         device = "cuda" if cuda_available else "cpu"
         if backend == "eager" and device == "cpu":
             pass  # eager runs on CPU
@@ -404,8 +404,8 @@ class TestLoraXSeparation:
         not fp32-accumulate — do not interpret this as a cross-backend bit-parity
         test).
         """
-        if backend == "cuda" and not cuda_available:
-            pytest.skip("CUDA backend not available")
+        if backend == "cuda" and not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
         device = "cuda" if cuda_available else "cpu"
         if backend != "eager" and device != "cuda":
             pytest.skip(f"backend {backend} needs cuda")
@@ -460,8 +460,8 @@ class TestSvdquantSmoke:
         (256, 128, 512, 32),
     ])
     def test_signed_forward_runs(self, cuda_available, seed, m, n, k, r):
-        if not cuda_available:
-            pytest.skip("CUDA required")
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
         device = "cuda"
         x = torch.randn(m, k, dtype=torch.bfloat16, device=device) * 0.3
         smooth = torch.ones(k, dtype=torch.bfloat16, device=device) * 1.0
@@ -487,8 +487,8 @@ class TestSvdquantSmoke:
     @pytest.mark.parametrize("fast_accum", [False, True])
     def test_tile_packed_matches_natural_cuda(self, cuda_available, seed, monkeypatch, fast_accum):
         """Tile-packed storage should be a layout-only change vs natural CUDA."""
-        if not cuda_available:
-            pytest.skip("CUDA required")
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
         if fast_accum:
             monkeypatch.setenv("COMFY_KITCHEN_SVDQUANT_FAST_ACCUM", "1")
         else:
@@ -529,8 +529,8 @@ class TestSvdquantSmoke:
     @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
     def test_fused_lora_epilogue_matches_unfused_cuda(self, cuda_available, seed, monkeypatch, layout, dtype):
         """Fused LoRA-up should match the old cuBLAS addmm_ epilogue to output dtype precision."""
-        if not cuda_available:
-            pytest.skip("CUDA required")
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
 
         m, n, k, r = 64, 256, 256, 32
         device = "cuda"

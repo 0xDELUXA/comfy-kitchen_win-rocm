@@ -11,6 +11,7 @@ from comfy_kitchen.tensor import TensorWiseINT8Layout
 
 from .conftest import (
     assert_values_close,
+    cuda_backend_available,
     get_capable_backends,
 )
 
@@ -131,8 +132,8 @@ def test_eager_int8_matmul_turing_n_alignment(monkeypatch):
 
 def test_cuda_int8_linear_does_not_retain_scratch_tensors():
     """CUDA INT8 linear uses per-call temporaries instead of retained scratch caches."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
+    if not cuda_backend_available():
+        pytest.skip("compiled CUDA backend required")
 
     x = torch.randn(16, 128, device="cuda", dtype=torch.bfloat16)
     weight = torch.randint(-128, 127, (64, 128), device="cuda", dtype=torch.int8)
@@ -248,8 +249,8 @@ def test_eager_int8_stochastic_rounding_tensorwise(seed):
 
 def test_cuda_int8_stochastic_rounding_seeded(seed):
     """CUDA stochastic INT8 rounding is seeded and unbiased."""
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
+    if not cuda_backend_available():
+        pytest.skip("compiled CUDA backend required")
 
     x = torch.full((4096,), 0.5, device="cuda", dtype=torch.float16)
     x[0] = 127.0
@@ -481,6 +482,8 @@ class TestTensorWiseINT8Layout:
 
     def test_int8_linear_cuda_single_row_gemv(self, seed):
         """CUDA int8_linear uses the single-row GEMV path correctly."""
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
         import comfy_kitchen as ck
         from comfy_kitchen.backends.eager.quantization import quantize_int8_tensorwise
 
@@ -554,6 +557,8 @@ class TestTensorWiseINT8Layout:
 
     def test_dequantize_direct_output_dtype_matches_final_cast(self, seed):
         """Direct fp16/bf16 dequant output matches the prior float32-then-cast behavior."""
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
         import comfy_kitchen as ck
 
         x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)
@@ -643,6 +648,8 @@ class TestTensorWiseINT8Layout:
 
     def test_convrot_weight_quantize_cuda_roundtrip(self, seed):
         """CUDA ConvRot weight quantization preserves the weight after inverse rotation."""
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
         from comfy_kitchen.backends import cuda as cuda_backend
         from comfy_kitchen.tensor.int8_utils import _build_hadamard, _rotate_weight
 
@@ -676,6 +683,8 @@ class TestTensorWiseINT8Layout:
 
     def test_convrot_int8_supports_65536_rows(self):
         """INT8 and INT4 kernels put large row counts in CUDA's grid.x dimension."""
+        if not cuda_backend_available():
+            pytest.skip("compiled CUDA backend required")
         rows, cols = 1 << 16, 256
         row = torch.linspace(-1.0, 1.0, cols, device="cuda", dtype=torch.bfloat16)
         weight = row.expand(rows, cols).contiguous()
