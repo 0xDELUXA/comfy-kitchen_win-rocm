@@ -1,5 +1,6 @@
 __all__ = [
     "adaln",
+    "rms_adaln",
     "apply_rope",
     "apply_rope_",
     "apply_rope1",
@@ -48,7 +49,7 @@ try:
         quantize_int8_rowwise as _eager_quantize_int8_rowwise,
     )
 
-    from .adaln import adaln
+    from .adaln import adaln, rms_adaln
     from .quantization import (
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
@@ -117,6 +118,14 @@ def _build_constraints() -> dict:
 
     out = {
         "adaln": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "scale": ParamConstraint(dtypes=standard_floats),
+                "shift": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=triton_devices,
+        ),
+        "rms_adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
                 "scale": ParamConstraint(dtypes=standard_floats),
@@ -220,6 +229,7 @@ def _build_constraints() -> dict:
                 "out_dtype": ParamConstraint(dtypes=standard_floats),
                 "convrot": ParamConstraint(dtypes=frozenset({bool})),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "input_act": ParamConstraint(dtypes=frozenset({str, type(None)})),
             },
             default_devices=triton_devices,
             min_compute_capability=(8, 0),  # Required for Triton INT8 dot

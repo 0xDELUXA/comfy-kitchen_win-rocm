@@ -1,5 +1,6 @@
 __all__ = [
     "adaln",
+    "rms_adaln",
     "apply_rope",
     "apply_rope_",
     "apply_rope1",
@@ -53,7 +54,7 @@ from comfy_kitchen.constraints import (
 )
 from comfy_kitchen.registry import registry
 
-from .adaln import adaln
+from .adaln import adaln, rms_adaln
 from .awq import gemv_awq_w4a16
 from .convrot_w4a4 import (
     convrot_w4a4_linear,
@@ -110,6 +111,14 @@ def _build_constraints() -> dict:
 
     out = {
         "adaln": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "scale": ParamConstraint(dtypes=standard_floats),
+                "shift": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "rms_adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
                 "scale": ParamConstraint(dtypes=standard_floats),

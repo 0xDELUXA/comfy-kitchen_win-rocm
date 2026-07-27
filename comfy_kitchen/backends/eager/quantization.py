@@ -8,6 +8,7 @@
 
 import torch
 
+from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
 from comfy_kitchen.float_utils import (
     E8M0_BIAS,
     F4_E2M1_MAX,
@@ -969,6 +970,7 @@ def int8_linear(
     out_dtype: torch.dtype = torch.bfloat16,
     convrot: bool = False,
     convrot_groupsize: int = 256,
+    input_act: str | None = None,
 ) -> torch.Tensor:
     """INT8 linear layer using torch.int8_mm with memory-efficient scaling.
 
@@ -987,6 +989,7 @@ def int8_linear(
     Returns:
         Result tensor [..., N].
     """
+    x = _apply_input_act(x, input_act)
     if x.shape[-1] != weight.shape[-1]:
         raise ValueError(
             f"Input and weight inner dimensions must match, got {x.shape[-1]} and {weight.shape[-1]}"
@@ -1202,6 +1205,7 @@ def _op_int8_linear(
     output_dtype_code: int,
     convrot: bool = False,
     convrot_groupsize: int = 256,
+    input_act: str | None = None,
 ) -> torch.Tensor:
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     kwargs = {
@@ -1212,12 +1216,14 @@ def _op_int8_linear(
         "out_dtype": out_dtype,
         "convrot": convrot,
         "convrot_groupsize": convrot_groupsize,
+        "input_act": input_act,
     }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
     return impl(**kwargs)
 
 
 @_op_int8_linear.register_fake
-def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code, convrot=False, convrot_groupsize=256):
+def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code,
+                         convrot=False, convrot_groupsize=256, input_act=None):
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)
