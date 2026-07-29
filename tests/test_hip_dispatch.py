@@ -8,12 +8,63 @@ routing rules would otherwise go untested behind a green tick.
 import ast
 import pathlib
 import re
+import subprocess
+import sys
 
 import pytest
+import torch
 
+import comfy_kitchen.scaled_mm_v2 as scaled_mm_module
 from comfy_kitchen.backends import hip as hip_backend
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
+_HIP_CMAKE = _ROOT / "comfy_kitchen" / "backends" / "hip" / "CMakeLists.txt"
+
+
+def test_non_rocm_runtime_does_not_import_hip_backend():
+    """A combined wheel must not load the ROCm runtime in CUDA/CPU processes."""
+    if getattr(torch.version, "hip", None):
+        pytest.skip("requires a non-ROCm PyTorch runtime")
+
+    code = """
+import sys
+import comfy_kitchen as ck
+
+assert "comfy_kitchen.backends.hip" not in sys.modules
+status = ck.list_backends()["hip"]
+assert not status["available"]
+assert status["unavailable_reason"] == "PyTorch ROCm/HIP runtime not available"
+"""
+    subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_scaled_mm_does_not_probe_hip_on_non_rocm_runtime(monkeypatch):
+    """Keep the HIP routing check off NVIDIA's latency-sensitive FP8 path."""
+    if getattr(torch.version, "hip", None):
+        pytest.skip("requires a non-ROCm PyTorch runtime")
+
+    sentinel = object()
+
+    def unexpected_hip_probe(*args, **kwargs):
+        raise AssertionError("HIP was probed without a ROCm PyTorch runtime")
+
+    monkeypatch.setattr(scaled_mm_module, "_hip_fp8_gemm", unexpected_hip_probe)
+    monkeypatch.setattr(scaled_mm_module, "has_scaled_mm_v2", lambda: True)
+    monkeypatch.setattr(torch.nn.functional, "scaled_mm", lambda *args, **kwargs: sentinel)
+
+    result = scaled_mm_module.scaled_mm_v2(
+        object(),
+        object(),
+        object(),
+        object(),
+    )
+    assert result is sentinel
 
 
 @pytest.mark.parametrize(
@@ -96,10 +147,93 @@ def _setup_py_default_archs() -> list[str]:
     raise AssertionError("DEFAULT_HIP_ARCHS not found in setup.py")
 
 
-def _cmake_default_archs() -> list[str]:
-    text = (_ROOT / "comfy_kitchen" / "backends" / "hip" / "CMakeLists.txt").read_text(
-        encoding="utf-8"
+def _setup_namespace() -> dict:
+    """Load setup.py definitions without executing its final setuptools.setup()."""
+    path = _ROOT / "setup.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    body = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "extensions"
+            for target in node.targets
+        ):
+            break
+        body.append(node)
+    module = ast.Module(body=body, type_ignores=[])
+    namespace = {"__file__": str(path), "__name__": "comfy_kitchen_setup_test"}
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace
+
+
+def test_setup_keeps_cuda_build_cuda_only_by_default():
+    namespace = _setup_namespace()
+    cuda_extension = object()
+
+    namespace["setup_cuda_extension"] = lambda: cuda_extension
+    namespace["setup_hip_extension"] = lambda: pytest.fail(
+        "an incidental ROCm compiler must not add HIP to a CUDA source build"
     )
+
+    assert namespace["get_extensions"]() == [cuda_extension]
+
+
+def test_setup_builds_both_backends_only_when_hip_is_requested():
+    namespace = _setup_namespace()
+    cuda_extension = object()
+    hip_extension = object()
+
+    namespace["BUILD_HIP"] = True
+    namespace["setup_cuda_extension"] = lambda: cuda_extension
+    namespace["setup_hip_extension"] = lambda: hip_extension
+
+    assert namespace["get_extensions"]() == [cuda_extension, hip_extension]
+
+
+def test_setup_refuses_hip_only_fallback_under_cuda_pytorch():
+    namespace = _setup_namespace()
+    missing_cuda = namespace["CudaToolkitNotFoundError"]
+
+    def raise_missing_cuda():
+        raise missing_cuda("nvcc missing")
+
+    namespace["setup_cuda_extension"] = raise_missing_cuda
+    namespace["get_rocm_path"] = lambda: ("/opt/rocm", object())
+    namespace["get_torch_gpu_runtime"] = lambda: "cuda"
+    namespace["setup_hip_extension"] = lambda: pytest.fail(
+        "CUDA PyTorch must not silently receive a HIP-only native build"
+    )
+
+    with pytest.raises(missing_cuda, match="refusing to replace"):
+        namespace["get_extensions"]()
+
+
+def test_no_cuda_means_python_only_unless_hip_is_explicit():
+    namespace = _setup_namespace()
+    namespace["BUILD_NO_CUDA"] = True
+    namespace["setup_cuda_extension"] = lambda: pytest.fail("CUDA was not disabled")
+    namespace["setup_hip_extension"] = lambda: pytest.fail("HIP was not requested")
+
+    assert namespace["get_extensions"]() == []
+
+
+def test_rocm_only_build_still_auto_selects_hip():
+    namespace = _setup_namespace()
+    missing_cuda = namespace["CudaToolkitNotFoundError"]
+    hip_extension = object()
+
+    def raise_missing_cuda():
+        raise missing_cuda("nvcc missing")
+
+    namespace["setup_cuda_extension"] = raise_missing_cuda
+    namespace["get_rocm_path"] = lambda: ("/opt/rocm", object())
+    namespace["get_torch_gpu_runtime"] = lambda: "hip"
+    namespace["setup_hip_extension"] = lambda: hip_extension
+
+    assert namespace["get_extensions"]() == [hip_extension]
+
+
+def _cmake_default_archs() -> list[str]:
+    text = _HIP_CMAKE.read_text(encoding="utf-8")
     block = re.search(r"set\(COMFY_HIP_ARCHS\s*(.*?)\)", text, re.DOTALL)
     assert block, "COMFY_HIP_ARCHS default not found in CMakeLists.txt"
     return re.findall(r'"(gfx\w+)"', block.group(1))
@@ -109,3 +243,31 @@ def test_hip_default_archs_match_the_cmake_default():
     """setup.py always passes -DCOMFY_HIP_ARCHS, so a drifted CMake default shows
     up only in a direct cmake run, silently missing whichever target was added."""
     assert _setup_py_default_archs() == _cmake_default_archs()
+
+
+def test_hip_kernels_are_independent_of_the_python_extension_target():
+    """Keep expensive HIP objects reusable across the CPython wheel matrix."""
+    text = _HIP_CMAKE.read_text(encoding="utf-8")
+
+    assert "add_library(comfy_kitchen_hip_kernels OBJECT ${HIP_SOURCES})" in text
+    assert "target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_hip_kernels>)" in text
+
+    module_calls = re.findall(r"nanobind_add_module\((.*?)\)", text, re.DOTALL)
+    assert module_calls
+    assert all("${HIP_SOURCES}" not in call for call in module_calls)
+
+
+def test_combined_wheel_cache_keys_include_hip_sources():
+    """HIP-only changes must produce a cache key that Actions can save."""
+    workflow = (_ROOT / ".github" / "workflows" / "build-wheels.yml").read_text(
+        encoding="utf-8"
+    )
+    combined_cache_keys = [
+        line.strip()
+        for line in workflow.splitlines()
+        if line.strip().startswith("key: ccache-")
+        and ("linux-x86_64" in line or "windows-x86_64" in line)
+    ]
+
+    assert len(combined_cache_keys) == 2
+    assert all("'comfy_kitchen/backends/hip/**'" in key for key in combined_cache_keys)

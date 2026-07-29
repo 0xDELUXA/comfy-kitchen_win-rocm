@@ -4,7 +4,6 @@ from .backends import cuda as _cuda_backend  # noqa: F401
 
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
-from .backends import hip as _hip_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
@@ -15,8 +14,6 @@ from .exceptions import (
     NoCapableBackendError,
 )
 from .float_utils import from_blocked, swap_nibbles, to_blocked
-
-# Import registry and exceptions
 from .registry import registry
 from .tensor.convrot_w4a4 import (
     convrot_w4a4_linear,
@@ -24,10 +21,18 @@ from .tensor.convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 
-# The HIP backend registers only on a supported AMD device (RDNA2/3/3.5/4), and
-# advertises only the ops that device can run; prefer it where it registers.
-if registry.is_available("hip"):
-    registry.set_priority(["hip", "cuda", "triton", "eager"])
+# Loading the HIP extension also loads the ROCm runtime. Do that only under a
+# ROCm PyTorch build so CUDA/CPU processes do not pay the import cost or acquire
+# an unrelated GPU runtime merely because a combined wheel contains the module.
+if getattr(torch.version, "hip", None):
+    from .backends import hip as _hip_backend  # noqa: F401
+
+    # The HIP backend registers only on a supported AMD device (RDNA2/3/3.5/4),
+    # and advertises only the ops that device can run; prefer it where it registers.
+    if registry.is_available("hip"):
+        registry.set_priority(["hip", "cuda", "triton", "eager"])
+else:
+    registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
 
 __all__ = [
     # Normalization

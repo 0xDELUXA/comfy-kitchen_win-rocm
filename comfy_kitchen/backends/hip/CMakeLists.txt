@@ -117,12 +117,28 @@ set(CPP_SOURCES
     dlpack_bindings.cpp
 )
 
+# Keep HIP compilation independent of the Python extension target. The kernels
+# consume HIP and project headers only, so a compiler cache can reuse their
+# objects across CPython wheel builds.
+add_library(comfy_kitchen_hip_kernels OBJECT ${HIP_SOURCES})
+target_compile_options(comfy_kitchen_hip_kernels PRIVATE
+    $<$<COMPILE_LANGUAGE:HIP>:-O3>
+    $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
+)
+if(COMFY_ENABLE_LINEINFO OR CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_options(
+        comfy_kitchen_hip_kernels PRIVATE
+        $<$<COMPILE_LANGUAGE:HIP>:-gline-tables-only>
+    )
+endif()
+target_include_directories(comfy_kitchen_hip_kernels PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(comfy_kitchen_hip_kernels PRIVATE hip::host)
+
 # NOMINSIZE: nanobind_add_module() otherwise puts -Os on the whole target, which the
-# -O3 below would have to override by flag order alone. The kernels are the point of
-# this module, so opt out rather than rely on which -O wins.
+# kernel object target already avoids. Keep it off the binding translation unit too.
 if(Python_VERSION VERSION_GREATER_EQUAL "3.12")
     message(STATUS "Python ${Python_VERSION} detected - enabling stable ABI (abi3)")
-    nanobind_add_module(_C NB_STATIC STABLE_ABI LTO NOMINSIZE ${CPP_SOURCES} ${HIP_SOURCES})
+    nanobind_add_module(_C NB_STATIC STABLE_ABI LTO NOMINSIZE ${CPP_SOURCES})
     if(WIN32)
         set_target_properties(_C PROPERTIES SUFFIX ".abi3.pyd")
     else()
@@ -131,19 +147,12 @@ if(Python_VERSION VERSION_GREATER_EQUAL "3.12")
     target_compile_definitions(_C PRIVATE Py_LIMITED_API=0x030C0000)
 else()
     message(STATUS "Python ${Python_VERSION} detected - building version-specific module")
-    nanobind_add_module(_C NB_STATIC LTO NOMINSIZE ${CPP_SOURCES} ${HIP_SOURCES})
+    nanobind_add_module(_C NB_STATIC LTO NOMINSIZE ${CPP_SOURCES})
 endif()
+
+target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_hip_kernels>)
 
 target_compile_definitions(_C PRIVATE NB_STATIC)
-
-target_compile_options(_C PRIVATE
-    $<$<COMPILE_LANGUAGE:HIP>:-O3>
-    $<$<COMPILE_LANGUAGE:HIP>:-ffast-math>
-)
-
-if(COMFY_ENABLE_LINEINFO OR CMAKE_BUILD_TYPE STREQUAL "Debug")
-    target_compile_options(_C PRIVATE $<$<COMPILE_LANGUAGE:HIP>:-gline-tables-only>)
-endif()
 
 target_include_directories(_C PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 

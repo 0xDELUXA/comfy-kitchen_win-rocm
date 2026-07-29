@@ -26,6 +26,7 @@ def has_scaled_mm_v2() -> bool:
 
 
 _FP8_E4M3 = torch.float8_e4m3fn
+_IS_HIP_RUNTIME = getattr(torch.version, "hip", None) is not None
 
 
 def _hip_fp8_gemm(
@@ -109,14 +110,6 @@ def scaled_mm_v2(
     swizzle_a: Optional['SwizzleType'] = SwizzleType.NO_SWIZZLE,
     swizzle_b: Optional['SwizzleType'] = SwizzleType.NO_SWIZZLE,
 ) -> torch.Tensor:
-
-    out = _hip_fp8_gemm(
-        input, weight, scale_a, scale_b, bias, out_dtype, scale_recipe_a, scale_recipe_b,
-        swizzle_a, swizzle_b,
-    )
-    if out is not None:
-        return out
-
     if has_scaled_mm_v2():
         return torch.nn.functional.scaled_mm(
             input,
@@ -162,6 +155,46 @@ def scaled_mm_v2(
             output = output + bias
 
         return output
+
+
+_scaled_mm_v2_torch = scaled_mm_v2
+
+
+def _scaled_mm_v2_hip(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    scale_a: torch.Tensor,
+    scale_b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    scale_recipe_a = ScalingType.TensorWise,
+    scale_recipe_b = ScalingType.TensorWise,
+    swizzle_a: Optional['SwizzleType'] = SwizzleType.NO_SWIZZLE,
+    swizzle_b: Optional['SwizzleType'] = SwizzleType.NO_SWIZZLE,
+) -> torch.Tensor:
+    out = _hip_fp8_gemm(
+        input, weight, scale_a, scale_b, bias, out_dtype, scale_recipe_a, scale_recipe_b,
+        swizzle_a, swizzle_b,
+    )
+    if out is not None:
+        return out
+    return _scaled_mm_v2_torch(
+        input,
+        weight,
+        scale_a,
+        scale_b,
+        bias=bias,
+        out_dtype=out_dtype,
+        scale_recipe_a=scale_recipe_a,
+        scale_recipe_b=scale_recipe_b,
+        swizzle_a=swizzle_a,
+        swizzle_b=swizzle_b,
+    )
+
+
+if _IS_HIP_RUNTIME:
+    scaled_mm_v2 = _scaled_mm_v2_hip
+
 
 # Version info for debugging
 def get_pytorch_version_info() -> dict[str, str | bool]:

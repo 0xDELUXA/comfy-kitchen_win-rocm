@@ -1,3 +1,4 @@
+import importlib
 import os
 import pathlib
 import platform
@@ -19,18 +20,16 @@ from setuptools.command.build_ext import build_ext
 # Parse command-line early to check for --no-cuda flag
 # This needs to happen before get_extensions() is called
 # Usage: python setup.py install --no-cuda
-#    or: pip install . --no-cuda
 BUILD_NO_CUDA = False
 if "--no-cuda" in sys.argv:
     BUILD_NO_CUDA = True
     sys.argv.remove("--no-cuda")  # Remove so setuptools doesn't complain
     print("\n" + "=" * 80)
-    print("Building CPU-only variant (--no-cuda flag)")
-    print("CUDA backend excluded - only eager, triton backends")
+    print("CUDA backend disabled (--no-cuda flag)")
     print("=" * 80 + "\n")
 
-# The HIP backend is built whenever a ROCm compiler is present. --hip turns a
-# missing compiler into an error rather than a skip; --no-hip suppresses it.
+# HIP is automatic on a ROCm-only build. --hip also adds it to a CUDA build and
+# turns a missing compiler into an error; --no-hip suppresses it.
 BUILD_HIP = os.getenv("COMFY_KITCHEN_BUILD_HIP") == "1"
 if "--hip" in sys.argv:
     BUILD_HIP = True
@@ -346,10 +345,11 @@ def get_hip_archs_override() -> list[str]:
 
 def detect_hip_archs() -> list[str]:
     """gfx names of the visible AMD devices, empty when none can be enumerated."""
+    # PyTorch is intentionally not a build dependency. Defer this optional,
+    # heavyweight import so ordinary metadata and CUDA-only builds do not load it.
     try:
-        import torch
-
-        if torch.version.hip is None or not torch.cuda.is_available():
+        torch = importlib.import_module("torch")
+        if getattr(torch.version, "hip", None) is None or not torch.cuda.is_available():
             return []
         names = [
             torch.cuda.get_device_properties(i).gcnArchName
@@ -358,6 +358,24 @@ def detect_hip_archs() -> list[str]:
     except Exception:
         return []
     return normalize_archs(";".join(n for n in names if n))
+
+
+def get_torch_gpu_runtime() -> str | None:
+    """Return the PyTorch GPU runtime when PyTorch is available to the build.
+
+    PyTorch is absent from an isolated build environment, so this is a guard
+    against selecting a useless HIP-only extension under an installed CUDA
+    PyTorch rather than a requirement for all builds.
+    """
+    try:
+        torch = importlib.import_module("torch")
+    except ImportError:
+        return None
+    if getattr(torch.version, "hip", None):
+        return "hip"
+    if getattr(torch.version, "cuda", None):
+        return "cuda"
+    return None
 
 
 def rocm_sdk_root() -> str | None:
@@ -660,19 +678,30 @@ def get_extensions() -> list[setuptools.Extension]:
             if cuda_ext is not None:
                 extensions.append(cuda_ext)
         except CudaToolkitNotFoundError as e:
-            # An absent toolkit is only survivable when there is a ROCm one to
-            # build instead. Any other CUDA failure propagates: silently dropping
-            # the CUDA extension would ship a HIP-only wheel under the name of a
-            # combined one.
+            # An absent toolkit is survivable on a ROCm host, but must not turn an
+            # NVIDIA source build into a successfully installed HIP-only package.
             _rocm_home, hip_compiler = get_rocm_path()
             if hip_compiler is None or BUILD_NO_HIP:
                 raise
+            if get_torch_gpu_runtime() == "cuda" and not BUILD_HIP:
+                raise CudaToolkitNotFoundError(
+                    f"{e} A ROCm compiler was also found, but CUDA PyTorch is installed; "
+                    "refusing to replace the missing CUDA backend with a HIP-only build. "
+                    "Install nvcc, use --no-cuda for a Python-only build, or explicitly "
+                    "request a cross-build with --hip."
+                ) from e
             print(f"\nNo CUDA toolkit ({e})")
             print("A ROCm toolchain was found, so building the HIP backend instead.\n")
 
-    hip_ext = setup_hip_extension()
-    if hip_ext is not None:
-        extensions.append(hip_ext)
+    # A CUDA source build stays CUDA-only unless HIP was explicitly requested.
+    # This prevents an incidental ROCm SDK from multiplying build time and failure
+    # surface on NVIDIA workstations. ROCm-only hosts still auto-select HIP after
+    # the missing-CUDA path above, and combined-wheel CI opts in explicitly.
+    build_hip_extension = BUILD_HIP or (not BUILD_NO_CUDA and not extensions)
+    if build_hip_extension:
+        hip_ext = setup_hip_extension()
+        if hip_ext is not None:
+            extensions.append(hip_ext)
 
     if not extensions:
         print("\n" + "=" * 80)
@@ -735,7 +764,7 @@ setup_kwargs = {
     "cmdclass": get_cmdclass(has_extensions=bool(extensions)),
 }
 
-if BUILD_NO_CUDA:
+if BUILD_NO_CUDA and not extensions:
     with open("pyproject.toml", "rb") as f:
         pyproject = tomllib.load(f)
 

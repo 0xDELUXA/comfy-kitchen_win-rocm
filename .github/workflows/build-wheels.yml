@@ -29,7 +29,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-4.13.6-linux-x86_64-cuda13-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'third_party/cutlass/.git') }}
+          key: ccache-4.13.6-linux-x86_64-cuda13-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'comfy_kitchen/backends/hip/**', 'third_party/cutlass/.git') }}
           restore-keys: |
             ccache-4.13.6-linux-x86_64-cuda13-
       - name: Set up Python 3.12
@@ -38,8 +38,8 @@ jobs:
           python-version: "3.12"
 
       # Build one wheel containing both CUDA and HIP native extensions.
-      # cibuildwheel invokes setup.py once inside a manylinux container; setup.py
-      # auto-detects both toolchains and emits cuda/_C*.so plus hip/_C*.so.
+      # cibuildwheel invokes setup.py once inside a manylinux container. The
+      # explicit HIP opt-in emits cuda/_C*.so plus hip/_C*.so.
       - name: Build CUDA+HIP wheel (manylinux)
         uses: pypa/cibuildwheel@v2.22.0
         env:
@@ -114,6 +114,7 @@ jobs:
             LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:/opt/rocm/lib:/opt/rocm/lib64:$LD_LIBRARY_PATH
             LIBRARY_PATH=/usr/local/cuda-13.0/lib64/stubs:$LIBRARY_PATH
             CMAKE_GENERATOR=Ninja
+            COMFY_KITCHEN_BUILD_HIP=1
             COMFY_CUDA_COMPILER_LAUNCHER=ccache
             COMFY_CXX_COMPILER_LAUNCHER=ccache
             CCACHE_DIR=/host${{ github.workspace }}/.ccache
@@ -365,7 +366,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-windows-x86_64-cuda13-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'third_party/cutlass/.git') }}
+          key: ccache-windows-x86_64-cuda13-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'comfy_kitchen/backends/hip/**', 'third_party/cutlass/.git') }}
           restore-keys: |
             ccache-windows-x86_64-cuda13-
 
@@ -470,9 +471,11 @@ jobs:
 
       - name: Build CUDA+HIP wheel
         shell: bash
+        env:
+          COMFY_KITCHEN_BUILD_HIP: "1"
         run: |
-          # setup.py detects both toolchains and emits cuda/_C* plus hip/_C* into one
-          # wheel. Python 3.12 produces an abi3 wheel (both extensions are built
+          # The explicit HIP opt-in emits cuda/_C* plus hip/_C* into one wheel.
+          # Python 3.12 produces an abi3 wheel (both extensions are built
           # against the limited API); 3.10/3.11 stay version-specific.
           #
           # COMFY_HIP_ARCHS is unset on purpose: with no AMD GPU visible,

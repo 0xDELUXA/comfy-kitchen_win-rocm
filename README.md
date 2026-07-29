@@ -87,9 +87,10 @@ from dispatch.
 
 ### Building
 
-The backend is built whenever a ROCm toolchain is found. Both a system ROCm
-install and the pip `rocm-sdk` layout (which a ROCm PyTorch build already pulls
-in) are detected automatically, so on Linux and Windows alike the build is:
+On a ROCm-only host, the backend is selected automatically when CUDA's `nvcc`
+is absent. Both a system ROCm install and the pip `rocm-sdk` layout (which a
+ROCm PyTorch build already pulls in) are detected, so on Linux and Windows alike
+the usual build is:
 
 ```bash
 pip install .
@@ -103,6 +104,14 @@ Microsoft C++ build tools and Windows SDK must be installed, since clang links
 against them and CMake compiles a resource file with the SDK's `rc.exe`, which
 the build locates itself rather than expecting on `PATH`. Use the Visual Studio
 2022 v143 toolset; newer MSVC toolsets are not yet reliable with ROCm.
+
+When CUDA and ROCm toolchains are both installed, the source build defaults to
+CUDA only. This avoids compiling an unused multi-architecture HIP binary on an
+NVIDIA workstation. Request a combined build explicitly:
+
+```bash
+COMFY_KITCHEN_BUILD_HIP=1 pip install .
+```
 
 Architectures default to the supported GPUs the build machine can see, or to
 every RDNA2/3/3.5/4 target ROCm supports when it can see none (a CI box), which
@@ -124,12 +133,13 @@ $env:COMFY_HIP_ARCHS = "gfx1201"; pip install .
 AMD GPUs but none is RDNA2/3/3.5/4 (CDNA has MFMA, not WMMA), the extension is
 skipped rather than built (seeing no GPU at all falls back to the full target list
 above instead);
-`COMFY_KITCHEN_BUILD_HIP=1` makes that a hard error instead, and
-`COMFY_KITCHEN_BUILD_NO_HIP=1` suppresses the backend entirely.
+`COMFY_KITCHEN_BUILD_HIP=1` requests HIP explicitly (and makes an unsupported
+visible AMD GPU a hard error), while `COMFY_KITCHEN_BUILD_NO_HIP=1` suppresses
+the backend entirely.
 
 Both extensions are built against the Python limited API on 3.12+, so a wheel
-carrying CUDA and HIP side by side keeps its `abi3` tag. Each backend withdraws
-itself at import when its runtime is absent.
+carrying CUDA and HIP side by side keeps its `abi3` tag. At runtime only the
+extension matching PyTorch's CUDA or ROCm runtime is loaded.
 
 
 ## Quantized Tensors
@@ -195,7 +205,10 @@ These options require using `setup.py` directly (not `pip install`):
 
 | Option | Command | Description | Default                                                                     |
 |--------|---------|-------------|-----------------------------------------------------------------------------|
-| `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Build CPU-only wheel (`py3-none-any`) | Enabled (build with CUDA)                                                   |
+| `--no-cuda` | `python setup.py bdist_wheel --no-cuda` | Disable CUDA; without `--hip`, build a CPU-only wheel | Enabled (build with CUDA)                                                   |
+| `--hip` | `python setup.py bdist_wheel --hip` | Add HIP explicitly (including to a CUDA build) | Auto only when CUDA is unavailable                                          |
+| `--no-hip` | `python setup.py bdist_wheel --no-hip` | Disable HIP | Disabled                                                                    |
+| `--hip-archs=...` | `python setup.py build_ext --hip-archs="gfx1200;gfx1201"` | HIP architectures to build for | Visible supported AMD GPUs, otherwise all supported targets                 |
 | `--cuda-archs=...` | `python setup.py build_ext --cuda-archs="80;89"` | CUDA architectures to build for | `75-virtual;80;89;90a;100f;120f` (Linux), `75-virtual;80;89;120f` (Windows) |
 | `--debug-build` | `python setup.py build_ext --debug-build` | Build in debug mode with symbols | Disabled (Release)                                                          |
 | `--lineinfo` | `python setup.py build_ext --lineinfo` | Enable NVCC line info for profiling | Disabled                                                                    |
