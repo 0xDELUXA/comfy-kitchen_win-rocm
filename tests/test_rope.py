@@ -175,6 +175,33 @@ def test_apply_rope_broadcasts_single_frequency(backend, split_half, device):
 
 
 @pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
+@pytest.mark.parametrize(
+    "q_seq_len,k_seq_len",
+    [(3, 3), (3, 5)],
+    ids=["shared-short-sequence", "short-query-long-key"],
+)
+def test_apply_rope_trims_excess_sequence_frequencies(
+    backend, q_seq_len, k_seq_len, device
+):
+    if backend not in get_capable_backends("apply_rope", device):
+        pytest.skip(f"{backend} does not support apply_rope on {device}")
+
+    q = torch.randn(2, 4, q_seq_len, 64, device=device, dtype=torch.float16)
+    k = torch.randn(2, 4, k_seq_len, 64, device=device, dtype=torch.float16)
+    freqs = torch.randn(1, 1, 5, 32, 2, 2, device=device, dtype=torch.float32)
+    reference = (
+        _reference_apply_rope(q, freqs[:, :, :q_seq_len]),
+        _reference_apply_rope(k, freqs[:, :, :k_seq_len]),
+    )
+
+    with ck.use_backend(backend):
+        actual = ck.apply_rope(q, k, freqs)
+
+    for result, expected in zip(actual, reference, strict=True):
+        torch.testing.assert_close(result, expected, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("backend", ["cuda", "triton", "eager"])
 @pytest.mark.parametrize("split_half", [False, True])
 @pytest.mark.parametrize("last_dim_strided", [False, True])
 def test_apply_rope_strided_views(backend, split_half, last_dim_strided, device):

@@ -1,6 +1,18 @@
 import torch
 
 
+def trim_rope_freqs(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+    """Trim excess sequence frequencies to match apply_rope's input."""
+    if (
+        x.ndim > 2
+        and freqs_cis.ndim > 2
+        and x.shape[2] != 1
+        and freqs_cis.shape[2] > x.shape[2]
+    ):
+        return freqs_cis[:, :, : x.shape[2]]
+    return freqs_cis
+
+
 def _storage_bounds(x: torch.Tensor) -> tuple[int, int]:
     lo = hi = x.storage_offset()
     for size, stride in zip(x.shape, x.stride(), strict=True):

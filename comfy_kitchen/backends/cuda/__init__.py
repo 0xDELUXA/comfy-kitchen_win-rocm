@@ -20,7 +20,11 @@ import sys
 
 import torch
 
-from comfy_kitchen._rope_utils import check_rope_inplace, detect_rms_rope_bnhd
+from comfy_kitchen._rope_utils import (
+    check_rope_inplace,
+    detect_rms_rope_bnhd,
+    trim_rope_freqs,
+)
 
 __all__ = [
     "adaln",
@@ -1973,6 +1977,8 @@ def rms_adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: fl
 def _apply_rope1_cuda(
     x: torch.Tensor, freqs_cis: torch.Tensor, *, split_half: bool, inplace: bool
 ) -> torch.Tensor:
+    if not split_half:
+        freqs_cis = trim_rope_freqs(x, freqs_cis)
     x_out = x if inplace else torch.empty_like(x)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
 
@@ -1997,6 +2003,8 @@ def _apply_rope_cuda(
             _apply_rope1_cuda(xq, freqs_cis, split_half=split_half, inplace=inplace),
             _apply_rope1_cuda(xk, freqs_cis, split_half=split_half, inplace=inplace),
         )
+    if not split_half:
+        freqs_cis = trim_rope_freqs(xq, freqs_cis)
     xq_out = xq if inplace else torch.empty_like(xq)
     xk_out = xk if inplace else torch.empty_like(xk)
     stream_ptr = torch.cuda.current_stream(xq.device).cuda_stream

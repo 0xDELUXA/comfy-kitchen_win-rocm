@@ -3,14 +3,13 @@
 
 import torch
 
-from comfy_kitchen._rope_utils import check_rope_inplace
+from comfy_kitchen._rope_utils import check_rope_inplace, trim_rope_freqs
 from comfy_kitchen.registry import registry
 
 
 def apply_rope1(x: torch.Tensor, freqs_cis: torch.Tensor):
     x_ = x.to(dtype=freqs_cis.dtype).reshape(*x.shape[:-1], -1, 1, 2)
-    if x_.shape[2] != 1 and freqs_cis.shape[2] != 1 and x_.shape[2] != freqs_cis.shape[2]:
-        freqs_cis = freqs_cis[:, :, :x_.shape[2]]
+    freqs_cis = trim_rope_freqs(x, freqs_cis)
 
     x_out = freqs_cis[..., 0] * x_[..., 0]
     x_out.addcmul_(freqs_cis[..., 1], x_[..., 1])
