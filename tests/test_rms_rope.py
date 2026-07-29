@@ -3,7 +3,7 @@ import torch
 
 import comfy_kitchen as ck
 
-from .conftest import assert_values_close, get_capable_backends
+from .conftest import assert_values_close, get_capable_backends, requires_cuda_backend
 
 
 def _reference_rms_rope(x, freqs_cis, scale, epsilon, *, split_half=False):
@@ -230,7 +230,7 @@ class TestRMSRopeSplitHalf:
 
 
 @pytest.mark.cuda
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@requires_cuda_backend
 @pytest.mark.parametrize(
     "op_name",
     ["rms_rope", "rms_rope1", "rms_rope_split_half", "rms_rope_split_half1"],

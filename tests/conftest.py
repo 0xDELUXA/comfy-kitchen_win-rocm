@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 import torch
 
@@ -8,6 +10,31 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "cuda: mark test as requiring CUDA")
     config.addinivalue_line("markers", "slow: mark test as slow running")
     config.addinivalue_line("markers", "cupy: mark test as requiring CuPy")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    # ROCm on Windows: pytest can hang at exit if HIP kernels left pending GPU
+    # work. See https://github.com/ROCm/TheRock/issues/999
+    torch = sys.modules.get("torch")
+    if sys.platform == "win32" and torch is not None:
+        if torch.cuda.is_available() and getattr(torch.version, "hip", None):
+            torch.cuda.synchronize()
+
+
+def cuda_backend_available() -> bool:
+    """Whether the compiled CUDA backend is loadable.
+
+    Not torch.cuda.is_available(): PyTorch reports ROCm devices as "cuda", so on
+    a ROCm build that is True with no CUDA extension present. Tests that drive
+    the CUDA backend specifically must gate on this or they fail instead of
+    skipping. On a CUDA box the two are equivalent.
+    """
+    return ck.list_backends().get("cuda", {}).get("available", False)
+
+
+requires_cuda_backend = pytest.mark.skipif(
+    not cuda_backend_available(), reason="compiled CUDA backend required"
+)
 
 
 @pytest.fixture(scope="session")
