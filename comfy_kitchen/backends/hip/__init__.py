@@ -15,8 +15,10 @@ declines the GEMMs, which fall through to triton/eager.
 """
 import functools
 import importlib.util
+import json
 import logging
 import os
+import pathlib
 import sys
 from collections.abc import Sequence
 
@@ -120,10 +122,18 @@ def _visible_gfx_arches() -> tuple[str | None, ...]:
     return tuple(_gfx_arch(i) for i in range(torch.cuda.device_count()))
 
 
-# RDNA2 has no matrix cores; RDNA3/3.5 and RDNA4 do. RDNA1 and older have neither
-# these nor the dot-product paths, and CDNA uses MFMA rather than WMMA.
-_ARCH_SUPPORTED = ("gfx103", "gfx11", "gfx12")
-_ARCH_WMMA = ("gfx11", "gfx12")
+# RDNA2 has no matrix cores; RDNA3/3.5 and RDNA4 do. This exact manifest is also
+# consumed by setup.py and CMake. Never infer support from a gfx prefix: a new
+# compiler-recognized target needs its WMMA policy reviewed before it is safe.
+_ARCH_MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "architectures.json")
+_ARCH_GROUPS = json.loads(
+    pathlib.Path(_ARCH_MANIFEST_PATH).read_text(encoding="utf-8")
+)
+_ARCH_ELEMENTWISE_ONLY = frozenset(_ARCH_GROUPS["elementwise_only"])
+_ARCH_WMMA_GFX11 = frozenset(_ARCH_GROUPS["wmma_gfx11"])
+_ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
+_ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
+_ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 
 # The GEMMs, and only the GEMMs, need matrix cores. Everything else is elementwise
 # or a scalar reduction and runs on any supported architecture. This set names the
@@ -147,9 +157,9 @@ def _unsupported_arch_reason(arches: Sequence[str | None]) -> str | None:
         return "no HIP device available"
     if any(a is None for a in arches):
         return "could not read the architecture of every visible device"
-    unsupported = sorted({a for a in arches if not a.startswith(_ARCH_SUPPORTED)})
+    unsupported = sorted({a for a in arches if a not in _ARCH_SUPPORTED})
     if unsupported:
-        return f"kernels require RDNA2/3/4, found {', '.join(unsupported)}"
+        return f"architecture is not in the validated target manifest: {', '.join(unsupported)}"
     return None
 
 
@@ -160,7 +170,7 @@ def _has_wmma(arches: Sequence[str | None]) -> bool:
     the capability set has to be the intersection over the visible devices: one
     RDNA2 card in an otherwise RDNA4 box means no GEMM is safe to advertise.
     """
-    return bool(arches) and all(a is not None and a.startswith(_ARCH_WMMA) for a in arches)
+    return bool(arches) and all(a in _ARCH_WMMA for a in arches)
 
 
 def is_available() -> bool:

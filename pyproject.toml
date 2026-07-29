@@ -46,6 +46,11 @@ build = [
     "nanobind>=2.0.0",
 ]
 
+[tool.setuptools]
+# MANIFEST.in makes native sources available to source builds. Wheels need only
+# the compiled extensions and explicitly declared runtime data below.
+include-package-data = false
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["comfy_kitchen*"]
@@ -53,6 +58,7 @@ exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 "comfy_kitchen.backends.cuda" = ["*.cuh", "*.h"]
+"comfy_kitchen.backends.hip" = ["architectures.json"]
 
 [tool.ruff]
 # Set the maximum line length to 100.

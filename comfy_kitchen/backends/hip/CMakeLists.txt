@@ -7,23 +7,75 @@ set(CMAKE_HIP_STANDARD 20)
 set(CMAKE_HIP_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# RDNA2/3/4. The GEMMs select a WMMA path per target in mma.h (gfx11 and gfx12
-# have different fragment layouts); RDNA2 has no matrix cores and builds only the
-# elementwise kernels. Override with --hip-archs / COMFY_HIP_ARCHS. Must precede
-# project(), which fails HIP compiler detection when CMAKE_HIP_ARCHITECTURES is unset.
-#
-# setup.py always passes -DCOMFY_HIP_ARCHS, so this is the default for a direct
-# cmake run only. test_hip_default_archs_match_the_cmake_default keeps it equal
-# to DEFAULT_HIP_ARCHS in setup.py.
-if(NOT DEFINED COMFY_HIP_ARCHS OR COMFY_HIP_ARCHS STREQUAL "")
-    # set() already joins its arguments with ";", so these must not carry their own.
-    set(COMFY_HIP_ARCHS
-        "gfx1030" "gfx1031" "gfx1032" "gfx1033" "gfx1034" "gfx1035" "gfx1036"  # RDNA2
-        "gfx1100" "gfx1101" "gfx1102" "gfx1103"                                # RDNA3
-        "gfx1150" "gfx1151" "gfx1152" "gfx1153"                                # RDNA3.5
-        "gfx1200" "gfx1201")                                                   # RDNA4
+# The exact target list and WMMA family classification are shared with setup.py
+# and runtime dispatch. Keep this before project(): invalid targets must fail
+# before compiler detection, and CMAKE_HIP_ARCHITECTURES must already be set.
+set(_CK_HIP_ARCH_MANIFEST "${CMAKE_CURRENT_SOURCE_DIR}/architectures.json")
+file(READ "${_CK_HIP_ARCH_MANIFEST}" _CK_HIP_ARCH_JSON)
+
+function(_ck_read_arch_group output group_name)
+    string(JSON _group_length LENGTH "${_CK_HIP_ARCH_JSON}" "${group_name}")
+    if(_group_length EQUAL 0)
+        message(FATAL_ERROR "${_CK_HIP_ARCH_MANIFEST}: ${group_name} must not be empty")
+    endif()
+
+    math(EXPR _last_index "${_group_length} - 1")
+    set(_group)
+    foreach(_index RANGE 0 ${_last_index})
+        string(JSON _arch GET "${_CK_HIP_ARCH_JSON}" "${group_name}" ${_index})
+        list(APPEND _group "${_arch}")
+    endforeach()
+    set(${output} "${_group}" PARENT_SCOPE)
+endfunction()
+
+_ck_read_arch_group(COMFY_HIP_ELEMENTWISE_ARCHS elementwise_only)
+_ck_read_arch_group(COMFY_HIP_WMMA_GFX11_ARCHS wmma_gfx11)
+_ck_read_arch_group(COMFY_HIP_WMMA_GFX12_ARCHS wmma_gfx12)
+set(COMFY_HIP_SUPPORTED_ARCHS
+    ${COMFY_HIP_ELEMENTWISE_ARCHS}
+    ${COMFY_HIP_WMMA_GFX11_ARCHS}
+    ${COMFY_HIP_WMMA_GFX12_ARCHS}
+)
+list(LENGTH COMFY_HIP_SUPPORTED_ARCHS _arch_count)
+list(REMOVE_DUPLICATES COMFY_HIP_SUPPORTED_ARCHS)
+list(LENGTH COMFY_HIP_SUPPORTED_ARCHS _unique_arch_count)
+if(NOT _arch_count EQUAL _unique_arch_count)
+    message(FATAL_ERROR "${_CK_HIP_ARCH_MANIFEST} contains duplicate targets")
 endif()
+
+if(NOT DEFINED COMFY_HIP_ARCHS OR COMFY_HIP_ARCHS STREQUAL "")
+    set(COMFY_HIP_ARCHS ${COMFY_HIP_SUPPORTED_ARCHS})
+endif()
+foreach(_arch IN LISTS COMFY_HIP_ARCHS)
+    if(NOT _arch IN_LIST COMFY_HIP_SUPPORTED_ARCHS)
+        message(FATAL_ERROR
+            "Unsupported COMFY_HIP_ARCHS target '${_arch}'. "
+            "Validated targets: ${COMFY_HIP_SUPPORTED_ARCHS}"
+        )
+    endif()
+endforeach()
 set(CMAKE_HIP_ARCHITECTURES "${COMFY_HIP_ARCHS}")
+
+function(_ck_make_arch_condition output)
+    set(_condition "")
+    foreach(_arch IN ITEMS ${ARGN})
+        if(NOT _condition STREQUAL "")
+            string(APPEND _condition " || ")
+        endif()
+        string(APPEND _condition "defined(__${_arch}__)")
+    endforeach()
+    set(${output} "${_condition}" PARENT_SCOPE)
+endfunction()
+
+_ck_make_arch_condition(COMFY_HIP_GFX11_CONDITION ${COMFY_HIP_WMMA_GFX11_ARCHS})
+_ck_make_arch_condition(COMFY_HIP_GFX12_CONDITION ${COMFY_HIP_WMMA_GFX12_ARCHS})
+set(_CK_HIP_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+file(MAKE_DIRECTORY "${_CK_HIP_GENERATED_INCLUDE_DIR}")
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/architecture_config.h.in"
+    "${_CK_HIP_GENERATED_INCLUDE_DIR}/architecture_config.h"
+    @ONLY
+)
 
 # A pip-installed rocm-sdk places the device bitcode under
 # lib/llvm/amdgcn/bitcode rather than the <root>/amdgcn/bitcode clang probes for.
@@ -131,7 +183,10 @@ if(COMFY_ENABLE_LINEINFO OR CMAKE_BUILD_TYPE STREQUAL "Debug")
         $<$<COMPILE_LANGUAGE:HIP>:-gline-tables-only>
     )
 endif()
-target_include_directories(comfy_kitchen_hip_kernels PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(comfy_kitchen_hip_kernels PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${_CK_HIP_GENERATED_INCLUDE_DIR}
+)
 target_link_libraries(comfy_kitchen_hip_kernels PRIVATE hip::host)
 
 # NOMINSIZE: nanobind_add_module() otherwise puts -Os on the whole target, which the
@@ -154,7 +209,10 @@ target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_hip_kernels>)
 
 target_compile_definitions(_C PRIVATE NB_STATIC)
 
-target_include_directories(_C PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(_C PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${_CK_HIP_GENERATED_INCLUDE_DIR}
+)
 
 target_link_libraries(_C PRIVATE hip::host)
 

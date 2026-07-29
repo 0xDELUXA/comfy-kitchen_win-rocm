@@ -30,6 +30,7 @@
 
 #include <cstdint>
 
+#include "architecture_config.h"
 #include "fp8_utils.h"
 
 namespace comfy::hip_backend {
@@ -46,24 +47,8 @@ typedef __bf16 v16bf __attribute__((ext_vector_type(16)));
 
 constexpr int kWave = 32;
 
-// __gfx*__ is defined only in device passes; the host pass falls through to the
-// stubs at the bottom. It never generates code for a kernel body but does
-// typecheck one, so every policy must still name valid types.
-//
-// gfx110x (RDNA3) and gfx115x (RDNA3.5) share one WMMA encoding. The list is
-// exhaustive over the targets ROCm supports: a missing one does not fail the
-// build, it silently drops that GPU into the no-WMMA stub.
-#if defined(__gfx1200__) || defined(__gfx1201__)
-#define COMFY_MMA_GFX12 1
-#elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
-    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) ||   \
-    defined(__gfx1152__) || defined(__gfx1153__)
-#define COMFY_MMA_GFX11 1
-#endif
-
-#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX11)
-#define COMFY_HAS_WMMA 1
-#endif
+// architecture_config.h is generated from architectures.json. __gfx*__ is
+// defined only in device passes; the host pass falls through to the stubs below.
 
 // ---------------------------------------------------------------------------
 // Fragment addressing, shared by both architectures.

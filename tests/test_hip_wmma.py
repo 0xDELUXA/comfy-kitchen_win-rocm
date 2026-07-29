@@ -886,7 +886,7 @@ def test_hip_registers_on_this_device():
     from comfy_kitchen.backends import hip as hip_backend
 
     arch = hip_backend._gfx_arch()
-    assert arch is not None and arch.startswith(hip_backend._ARCH_SUPPORTED)
+    assert arch in hip_backend._ARCH_SUPPORTED
     assert hip_backend.is_available()
     # has_wmma() is the intersection over every visible device, while arch names
     # only this one; derive the expectation from the same device set. The GEMM

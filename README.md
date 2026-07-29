@@ -113,13 +113,13 @@ NVIDIA workstation. Request a combined build explicitly:
 COMFY_KITCHEN_BUILD_HIP=1 pip install .
 ```
 
-Architectures default to the supported GPUs the build machine can see, or to
-every RDNA2/3/3.5/4 target ROCm supports when it can see none (a CI box), which
-is what the wheels carry. Detection reads the visible devices through PyTorch, so
-under PEP 517 build isolation (a plain `pip install .`) it sees nothing and falls
-back to the full target list; set `COMFY_HIP_ARCHS`, or pass
-`--no-build-isolation`, to build for the local GPU instead. Building for one
-target is much faster:
+Architectures default to the validated GPUs the build machine can see, or to
+every target in the backend's architecture manifest when it can see none (a CI
+box), which is what the wheels carry. Detection reads the visible devices
+through PyTorch, so under PEP 517 build isolation (a plain `pip install .`) it
+sees nothing and falls back to the full target list; set `COMFY_HIP_ARCHS`, or
+pass `--no-build-isolation`, to build for the local GPU instead. Building for
+one target is much faster:
 
 ```bash
 COMFY_HIP_ARCHS=gfx1201 pip install .
@@ -136,6 +136,10 @@ above instead);
 `COMFY_KITCHEN_BUILD_HIP=1` requests HIP explicitly (and makes an unsupported
 visible AMD GPU a hard error), while `COMFY_KITCHEN_BUILD_NO_HIP=1` suppresses
 the backend entirely.
+
+Architecture overrides are exact and fail closed. A compiler-recognized target
+that is not in the manifest is rejected until its device and WMMA policies have
+been reviewed and added.
 
 Both extensions are built against the Python limited API on 3.12+, so a wheel
 carrying CUDA and HIP side by side keeps its `abi3` tag. At runtime only the

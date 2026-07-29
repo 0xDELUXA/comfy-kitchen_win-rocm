@@ -1,4 +1,5 @@
 import importlib
+import json
 import os
 import pathlib
 import platform
@@ -303,23 +304,37 @@ def get_cuda_path() -> tuple[pathlib.Path, pathlib.Path] | None:
 
     return pathlib.Path(cuda_home), nvcc_bin
 
-# RDNA2 (gfx103x), RDNA3/3.5 (gfx11xx) and RDNA4 (gfx12xx). RDNA1 and older lack
-# even the dot-product paths, and CDNA's matrix cores are MFMA, not WMMA.
-SUPPORTED_HIP_ARCH_PREFIXES = ("gfx103", "gfx11", "gfx12")
-
-# The wheel's default fat binary: every RDNA2/3/3.5/4 target ROCm supports. RDNA2
-# carries only the elementwise kernels, so the size is dominated by the ten
-# gfx11xx/gfx12xx code objects.
-DEFAULT_HIP_ARCHS = (
-    "gfx1030;gfx1031;gfx1032;gfx1033;gfx1034;gfx1035;gfx1036"  # RDNA2
-    ";gfx1100;gfx1101;gfx1102;gfx1103"  # RDNA3
-    ";gfx1150;gfx1151;gfx1152;gfx1153"  # RDNA3.5
-    ";gfx1200;gfx1201"  # RDNA4
+# Keep build-time, CMake, and runtime architecture policy in one package resource.
+# Exact membership is intentional: accepting an unreviewed gfx11xx/gfx12xx target
+# can compile the no-WMMA trap stubs into an otherwise successful wheel.
+HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12")
+HIP_ARCH_MANIFEST_PATH = (
+    pathlib.Path(__file__).resolve().parent
+    / "comfy_kitchen"
+    / "backends"
+    / "hip"
+    / "architectures.json"
 )
+HIP_ARCH_GROUPS = json.loads(HIP_ARCH_MANIFEST_PATH.read_text(encoding="utf-8"))
+if tuple(HIP_ARCH_GROUPS) != HIP_ARCH_GROUP_NAMES:
+    raise RuntimeError(
+        f"{HIP_ARCH_MANIFEST_PATH} must contain these groups in order: "
+        f"{', '.join(HIP_ARCH_GROUP_NAMES)}"
+    )
+
+SUPPORTED_HIP_ARCHS = tuple(
+    arch
+    for group_name in HIP_ARCH_GROUP_NAMES
+    for arch in HIP_ARCH_GROUPS[group_name]
+)
+if not SUPPORTED_HIP_ARCHS or len(SUPPORTED_HIP_ARCHS) != len(set(SUPPORTED_HIP_ARCHS)):
+    raise RuntimeError(f"{HIP_ARCH_MANIFEST_PATH} is empty or contains duplicate targets")
+
+DEFAULT_HIP_ARCHS = ";".join(SUPPORTED_HIP_ARCHS)
 
 
 def hip_arch_supported(arch: str) -> bool:
-    return arch.startswith(SUPPORTED_HIP_ARCH_PREFIXES)
+    return arch in SUPPORTED_HIP_ARCHS
 
 
 def normalize_archs(value: str) -> list[str]:
@@ -540,8 +555,8 @@ def setup_hip_extension() -> CMakeExtension | None:
         unsupported = [arch for arch in archs if not hip_arch_supported(arch)]
         if unsupported:
             raise RuntimeError(
-                f"ERROR: the HIP backend supports RDNA2/3/4 (gfx103x, gfx11xx, gfx12xx); "
-                f"cannot build for {';'.join(unsupported)}"
+                f"ERROR: unsupported HIP architecture target(s): {';'.join(unsupported)}. "
+                f"Validated targets: {';'.join(SUPPORTED_HIP_ARCHS)}"
             )
         print(f"HIP architectures from the override: {';'.join(archs)}")
     else:

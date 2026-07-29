@@ -6,6 +6,7 @@ on a CPU-only runner the kernel suite in test_hip_wmma.py skips in full, and the
 routing rules would otherwise go untested behind a green tick.
 """
 import ast
+import json
 import pathlib
 import re
 import subprocess
@@ -18,7 +19,19 @@ import comfy_kitchen.scaled_mm_v2 as scaled_mm_module
 from comfy_kitchen.backends import hip as hip_backend
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
-_HIP_CMAKE = _ROOT / "comfy_kitchen" / "backends" / "hip" / "CMakeLists.txt"
+_HIP_DIR = _ROOT / "comfy_kitchen" / "backends" / "hip"
+_HIP_CMAKE = _HIP_DIR / "CMakeLists.txt"
+_HIP_ARCH_MANIFEST = _HIP_DIR / "architectures.json"
+_HIP_ARCH_GROUP_NAMES = ("elementwise_only", "wmma_gfx11", "wmma_gfx12")
+
+
+def _architecture_groups() -> dict[str, list[str]]:
+    return json.loads(_HIP_ARCH_MANIFEST.read_text(encoding="utf-8"))
+
+
+def _manifest_archs() -> list[str]:
+    groups = _architecture_groups()
+    return [arch for group_name in _HIP_ARCH_GROUP_NAMES for arch in groups[group_name]]
 
 
 def test_non_rocm_runtime_does_not_import_hip_backend():
@@ -81,12 +94,32 @@ def test_hip_declines_unsupported_arch(arches):
     assert hip_backend._unsupported_arch_reason(arches) is not None
 
 
+@pytest.mark.parametrize("arch", _manifest_archs())
+def test_hip_accepts_every_manifest_target(arch):
+    assert hip_backend._unsupported_arch_reason([arch]) is None
+
+
 @pytest.mark.parametrize(
-    "arches",
-    [["gfx1201", "gfx1200"], ["gfx1100"], ["gfx1151"], ["gfx1030"], ["gfx1200", "gfx1030"]],
+    "arch",
+    [
+        "gfx1037",
+        "gfx1104",
+        "gfx1154",
+        "gfx1170",
+        "gfx1171",
+        "gfx1172",
+        "gfx1202",
+        "gfx1250",
+        "gfx1251",
+        "gfx11-generic",
+        "gfx12-generic",
+        "gfx12-5-generic",
+    ],
 )
-def test_hip_accepts_rdna2_through_rdna4(arches):
-    assert hip_backend._unsupported_arch_reason(arches) is None
+def test_hip_rejects_unreviewed_near_prefix_targets(arch):
+    """A future target must not silently inherit a possibly incompatible WMMA policy."""
+    assert hip_backend._unsupported_arch_reason([arch]) is not None
+    assert not hip_backend._has_wmma([arch])
 
 
 def test_hip_declines_when_an_arch_cannot_be_read():
@@ -134,17 +167,6 @@ def test_hip_advertises_every_inplace_rope_entry():
                        "apply_rope_split_half1", "rms_rope", "rms_rope1",
                        "rms_rope_split_half", "rms_rope_split_half1"):
         assert constraints[f"{functional}_"] is constraints[functional]
-
-
-def _setup_py_default_archs() -> list[str]:
-    """DEFAULT_HIP_ARCHS, read without importing setup.py (which would run setup())."""
-    tree = ast.parse((_ROOT / "setup.py").read_text(encoding="utf-8"))
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and any(
-            isinstance(t, ast.Name) and t.id == "DEFAULT_HIP_ARCHS" for t in node.targets
-        ):
-            return ast.literal_eval(node.value).split(";")
-    raise AssertionError("DEFAULT_HIP_ARCHS not found in setup.py")
 
 
 def _setup_namespace() -> dict:
@@ -232,17 +254,58 @@ def test_rocm_only_build_still_auto_selects_hip():
     assert namespace["get_extensions"]() == [hip_extension]
 
 
-def _cmake_default_archs() -> list[str]:
+def test_architecture_manifest_is_unique_and_shared_by_setup_and_runtime():
+    groups = _architecture_groups()
+    manifest_archs = _manifest_archs()
+    namespace = _setup_namespace()
+
+    assert tuple(groups) == _HIP_ARCH_GROUP_NAMES
+    assert len(manifest_archs) == len(set(manifest_archs))
+    assert tuple(manifest_archs) == namespace["SUPPORTED_HIP_ARCHS"]
+    assert manifest_archs == namespace["DEFAULT_HIP_ARCHS"].split(";")
+    assert set(groups["elementwise_only"]) == hip_backend._ARCH_ELEMENTWISE_ONLY
+    assert set(groups["wmma_gfx11"]) == hip_backend._ARCH_WMMA_GFX11
+    assert set(groups["wmma_gfx12"]) == hip_backend._ARCH_WMMA_GFX12
+    assert set(manifest_archs) == hip_backend._ARCH_SUPPORTED
+
+
+def test_setup_architecture_check_is_exact_and_fail_closed():
+    namespace = _setup_namespace()
+    supported = namespace["hip_arch_supported"]
+
+    assert all(supported(arch) for arch in _manifest_archs())
+    for arch in ("gfx1037", "gfx1104", "gfx1170", "gfx1202", "gfx1250"):
+        assert not supported(arch)
+
+
+def test_cmake_reads_and_validates_the_shared_architecture_manifest():
     text = _HIP_CMAKE.read_text(encoding="utf-8")
-    block = re.search(r"set\(COMFY_HIP_ARCHS\s*(.*?)\)", text, re.DOTALL)
-    assert block, "COMFY_HIP_ARCHS default not found in CMakeLists.txt"
-    return re.findall(r'"(gfx\w+)"', block.group(1))
+
+    assert 'file(READ "${_CK_HIP_ARCH_MANIFEST}"' in text
+    assert "string(JSON" in text
+    assert "IN_LIST COMFY_HIP_SUPPORTED_ARCHS" in text
+    assert "configure_file(" in text
+    assert not re.search(r'"gfx\d', text)
 
 
-def test_hip_default_archs_match_the_cmake_default():
-    """setup.py always passes -DCOMFY_HIP_ARCHS, so a drifted CMake default shows
-    up only in a direct cmake run, silently missing whichever target was added."""
-    assert _setup_py_default_archs() == _cmake_default_archs()
+def test_mma_architecture_macros_are_generated_from_the_manifest():
+    mma = (_HIP_DIR / "mma.h").read_text(encoding="utf-8")
+    template = (_HIP_DIR / "architecture_config.h.in").read_text(encoding="utf-8")
+
+    assert '#include "architecture_config.h"' in mma
+    assert "defined(__gfx" not in mma
+    assert "@COMFY_HIP_GFX11_CONDITION@" in template
+    assert "@COMFY_HIP_GFX12_CONDITION@" in template
+
+
+def test_sdist_rules_include_every_hip_build_input():
+    manifest = (_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+    pyproject = (_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+    assert "include comfy_kitchen/backends/hip/CMakeLists.txt" in manifest
+    assert "recursive-include comfy_kitchen/backends/hip *.cpp *.h *.hip *.in *.json" in manifest
+    assert "include-package-data = false" in pyproject
+    assert '"comfy_kitchen.backends.hip" = ["architectures.json"]' in pyproject
 
 
 def test_hip_kernels_are_independent_of_the_python_extension_target():
