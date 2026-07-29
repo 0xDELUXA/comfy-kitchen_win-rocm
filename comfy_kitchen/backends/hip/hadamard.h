@@ -32,10 +32,22 @@ inline void check_convrot_group_size(int group_size) {
 // The kernel's static LDS: the g[256] and red[256] reductions below.
 constexpr size_t kConvrotStaticLds = 2 * 256 * sizeof(float);
 
-// convrot_quant_kernel stages the whole rotated row in dynamic LDS, so K is
-// bounded by what is left of the workgroup budget. Past it the launch does not
-// fail cleanly, so the wrappers fall back to eager instead. 0 means unknown.
-inline int convrot_max_k() {
+// convrot_quant_kernel stages the whole rotated row in dynamic LDS, preserving
+// the input dtype's rounding contract. K is therefore bounded by both the
+// workgroup budget and the input element size. Past it the wrappers fall back
+// to eager instead. 0 means unknown or an invalid dtype code.
+inline size_t convrot_row_element_size(int in_dtype) {
+    if (in_dtype == 0) return sizeof(float);
+    if (in_dtype == 1) return sizeof(__half);
+    if (in_dtype == 2) return sizeof(__bf16);
+    return 0;
+}
+
+inline int convrot_max_k(int in_dtype) {
+    const size_t element_size = convrot_row_element_size(in_dtype);
+    if (element_size == 0) {
+        return 0;
+    }
     int device = 0;
     if (hipGetDevice(&device) != hipSuccess) {
         return 0;
@@ -47,17 +59,17 @@ inline int convrot_max_k() {
         return 0;
     }
     return static_cast<int>((static_cast<size_t>(lds) - kConvrotStaticLds) /
-                            sizeof(__bf16));
+                            element_size);
 }
 
-inline void check_convrot_k(int k, int group_size) {
+inline void check_convrot_k(int k, int group_size, int in_dtype) {
     // The kernel rotates K/G whole groups but reads back all K entries of the row
     // buffer, so a partial trailing group would quantize uninitialized LDS.
     if (group_size <= 0 || k % group_size != 0) {
         throw std::runtime_error("convrot: K=" + std::to_string(k) +
                                  " is not divisible by group_size=" + std::to_string(group_size));
     }
-    const int max_k = convrot_max_k();
+    const int max_k = convrot_max_k(in_dtype);
     if (max_k <= 0 || k > max_k) {
         throw std::runtime_error("convrot: K=" + std::to_string(k) +
                                  " does not fit in LDS (max " + std::to_string(max_k) + ")");
@@ -91,7 +103,27 @@ __forceinline__ __device__ float apply_input_act(float v) {
     return v;
 }
 
-template <bool PACK_INT4, int ACT = kActNone>
+template <typename RowT>
+__forceinline__ __device__ RowT store_row_value(float v) {
+    return static_cast<RowT>(v);
+}
+
+template <>
+__forceinline__ __device__ __half store_row_value<__half>(float v) {
+    return __float2half(v);
+}
+
+template <typename RowT>
+__forceinline__ __device__ float load_row_value(RowT v) {
+    return static_cast<float>(v);
+}
+
+template <>
+__forceinline__ __device__ float load_row_value<__half>(__half v) {
+    return __half2float(v);
+}
+
+template <typename RowT, bool PACK_INT4, int ACT = kActNone>
 __global__ __launch_bounds__(256) void convrot_quant_kernel(
     const void* __restrict__ x, int in_dtype,
     int8_t* __restrict__ qout, float* __restrict__ scaleout,
@@ -100,7 +132,8 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
     const float h4[4][4] = {{1, 1, 1, -1}, {1, 1, -1, 1}, {1, -1, 1, 1}, {-1, 1, 1, 1}};
     __shared__ float g[256];
     __shared__ float red[256];
-    extern __shared__ __bf16 rowbuf[];  // K entries: the rotated row
+    extern __shared__ unsigned char rowbuf_raw[];
+    RowT* rowbuf = reinterpret_cast<RowT*>(rowbuf_raw);  // K entries: the rotated row
 
     const int row = blockIdx.x;
     const int t = threadIdx.x;
@@ -138,9 +171,9 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
 
         if (active) {
             const float tv = g[t] * norm;
-            const __bf16 bv = static_cast<__bf16>(tv);
-            rowbuf[static_cast<int64_t>(grp) * G + e] = bv;
-            lmax = fmaxf(lmax, fabsf(static_cast<float>(bv)));
+            const RowT stored = store_row_value<RowT>(tv);
+            rowbuf[static_cast<int64_t>(grp) * G + e] = stored;
+            lmax = fmaxf(lmax, fabsf(load_row_value(stored)));
         }
         __syncthreads();
     }
@@ -161,8 +194,8 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
     if constexpr (PACK_INT4) {
         const int Kp = K / 2;
         for (int jb = t; jb < Kp; jb += 256) {
-            const float a = static_cast<float>(rowbuf[2 * jb]);
-            const float b = static_cast<float>(rowbuf[2 * jb + 1]);
+            const float a = load_row_value(rowbuf[2 * jb]);
+            const float b = load_row_value(rowbuf[2 * jb + 1]);
             int qa = static_cast<int>(rintf(a * inv));
             int qb = static_cast<int>(rintf(b * inv));
             qa = qa < -7 ? -7 : (qa > 7 ? 7 : qa);
@@ -172,11 +205,31 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
         }
     } else {
         for (int j = t; j < K; j += 256) {
-            const float v = static_cast<float>(rowbuf[j]);
+            const float v = load_row_value(rowbuf[j]);
             int q = static_cast<int>(rintf(v * inv));
             q = q < -127 ? -127 : (q > 127 ? 127 : q);
             qout[static_cast<int64_t>(row) * K + j] = static_cast<int8_t>(q);
         }
+    }
+}
+
+template <bool PACK_INT4, int ACT = kActNone>
+inline void launch_convrot_quant(
+    const void* x, int in_dtype, int8_t* qout, float* scaleout,
+    int M, int K, int group_size, hipStream_t stream) {
+
+    const size_t shmem = static_cast<size_t>(K) * convrot_row_element_size(in_dtype);
+    if (in_dtype == 0) {
+        convrot_quant_kernel<float, PACK_INT4, ACT><<<M, 256, shmem, stream>>>(
+            x, in_dtype, qout, scaleout, M, K, group_size);
+    } else if (in_dtype == 1) {
+        convrot_quant_kernel<__half, PACK_INT4, ACT><<<M, 256, shmem, stream>>>(
+            x, in_dtype, qout, scaleout, M, K, group_size);
+    } else if (in_dtype == 2) {
+        convrot_quant_kernel<__bf16, PACK_INT4, ACT><<<M, 256, shmem, stream>>>(
+            x, in_dtype, qout, scaleout, M, K, group_size);
+    } else {
+        throw std::runtime_error("convrot: unsupported input dtype code");
     }
 }
 

@@ -54,7 +54,7 @@ void launch_quantize_int8_tensorwise_kernel(const void*, int, void*, void*, void
                                             hipStream_t);
 void launch_convrot_quant_int4_kernel(const void*, int, void*, void*, int, int, int, hipStream_t);
 void launch_unpack_int4_kernel(const void*, void*, int64_t, hipStream_t);
-int convrot_max_k_host();
+int convrot_max_k_host(int);
 
 void launch_adaln_kernel(const void*, const void*, const void*, void*, int, int, int, int, float,
                          int, int, int, bool, hipStream_t);

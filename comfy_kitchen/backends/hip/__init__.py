@@ -411,12 +411,14 @@ def quantize_int8_tensorwise(
     return q, out_scale
 
 
-# Keyed by device: convrot_max_k() reports the LDS budget of whichever device is
-# current, which a process with more than one GPU can switch under a shared cache.
-_convrot_max_k: dict[int, int] = {}
+# Keyed by device and dtype: convrot_max_k() reports the LDS budget of whichever
+# device is current and FP32 rows consume twice the LDS of FP16/BF16 rows.
+_convrot_max_k: dict[tuple[int, torch.dtype], int] = {}
 
 
-def _convrot_supported(k: int, group_size: int, device: torch.device) -> bool:
+def _convrot_supported(
+    k: int, group_size: int, device: torch.device, dtype: torch.dtype
+) -> bool:
     """Whether the fused rotation can take a row of this width on ``device``.
 
     It stages the whole row in LDS, which bounds K per device, and it rotates K/G
@@ -429,13 +431,16 @@ def _convrot_supported(k: int, group_size: int, device: torch.device) -> bool:
     """
     if group_size not in (16, 64, 256) or k % group_size != 0:
         return False
+    if dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return False
 
     index = device.index if device.index is not None else torch.cuda.current_device()
-    max_k = _convrot_max_k.get(index)
+    key = (index, dtype)
+    max_k = _convrot_max_k.get(key)
     if max_k is None:
         with torch.cuda.device(index):
-            max_k = _C.convrot_max_k()
-        _convrot_max_k[index] = max_k
+            max_k = _C.convrot_max_k(DTYPE_TO_CODE[dtype])
+        _convrot_max_k[key] = max_k
     return max_k > 0 and k <= max_k
 
 
@@ -467,7 +472,9 @@ def quantize_and_rotate_rowwise(
     fused kernel synthesizes the same transform from radix-4 butterflies, so the
     argument is accepted and unused.
     """
-    if stochastic_rounding or not _convrot_supported(x.shape[-1], group_size, x.device):
+    if stochastic_rounding or not _convrot_supported(
+        x.shape[-1], group_size, x.device, x.dtype
+    ):
         return _eager.quantize_and_rotate_rowwise(
             x, h, group_size, stochastic_rounding=stochastic_rounding
         )
@@ -486,7 +493,9 @@ def quantize_int8_convrot_weight(
 
     Uses the same fused kernel as the activation path.
     """
-    if stochastic_rounding or not _convrot_supported(weight.shape[-1], group_size, weight.device):
+    if stochastic_rounding or not _convrot_supported(
+        weight.shape[-1], group_size, weight.device, weight.dtype
+    ):
         return _eager.quantize_int8_convrot_weight(
             weight, group_size, stochastic_rounding=stochastic_rounding
         )
@@ -537,7 +546,7 @@ def int8_linear(
             raise ValueError(
                 f"ConvRot group size {convrot_groupsize} does not divide input features {k}"
             )
-        if not _convrot_supported(k, convrot_groupsize, x.device):
+        if not _convrot_supported(k, convrot_groupsize, x.device, x.dtype):
             return _eager.int8_linear(
                 x, weight, weight_scale, bias, out_dtype, convrot, convrot_groupsize,
                 input_act=input_act,
@@ -579,7 +588,9 @@ def quantize_convrot_w4a4_weight(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if quant_group_size != _INT4_GROUP_SIZE:
         raise ValueError(f"int4 MMA kernel requires quant_group_size {_INT4_GROUP_SIZE}")
-    if stochastic_rounding or not _convrot_supported(weight.shape[-1], convrot_groupsize, weight.device):
+    if stochastic_rounding or not _convrot_supported(
+        weight.shape[-1], convrot_groupsize, weight.device, weight.dtype
+    ):
         return _eager.quantize_convrot_w4a4_weight(
             weight, convrot_groupsize, quant_group_size, stochastic_rounding
         )
@@ -655,7 +666,7 @@ def convrot_w4a4_linear(
         raise ValueError(
             f"Input K={x.shape[-1]} not divisible by convrot_groupsize {convrot_groupsize}"
         )
-    if not _convrot_supported(x.shape[-1], convrot_groupsize, x.device):
+    if not _convrot_supported(x.shape[-1], convrot_groupsize, x.device, x.dtype):
         return _eager.convrot_w4a4_linear(
             x, qweight, wscales, bias, convrot_groupsize, quant_group_size, linear_dtype
         )

@@ -8,7 +8,12 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
+from comfy_kitchen.backends.eager.convrot_w4a4 import _unpack_int4_row_major
+from comfy_kitchen.backends.eager.quantization import (
+    quantize_and_rotate_rowwise as eager_quantize_and_rotate_rowwise,
+)
 from comfy_kitchen.registry import registry
+from comfy_kitchen.tensor.int8_utils import _build_hadamard
 
 
 def _unavailable_reason() -> str | None:
@@ -261,8 +266,6 @@ def test_convrot_quantizer_folds_the_activation_in(hip):
     It is normally better: the eager chain rounds gelu's output back to the input
     dtype before the quantizer sees it, while the fold stays in fp32 throughout.
     """
-    from comfy_kitchen.tensor.int8_utils import _build_hadamard
-
     torch.manual_seed(0)
     group = 256
     x = torch.randn(512, 1024, device=DEV, dtype=torch.bfloat16) * 2.0
@@ -286,6 +289,44 @@ def test_convrot_quantizer_folds_the_activation_in(hip):
     assert fused_s.shape == (x.shape[0],)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_convrot_int8_preserves_input_dtype_precision(hip, dtype):
+    """The fused row buffer must not introduce a BF16-only rounding stage."""
+    group = 16
+    x = torch.zeros(2, 64, device=DEV, dtype=dtype)
+    x[0, 0] = 1.001
+    x[1, 16] = 3.141
+    h = _build_hadamard(group, device=DEV, dtype=dtype)
+
+    q_hip, scales_hip = hip.quantize_and_rotate_rowwise(x, h, group)
+    q_eager, scales_eager = eager_quantize_and_rotate_rowwise(x, h, group)
+
+    values = torch.stack((x[0, 0], x[1, 16]))
+    expected_rowmax = (values.float() * 0.25).to(dtype).float().abs()
+    torch.testing.assert_close(scales_hip.reshape(-1) * 127.0, expected_rowmax, rtol=1e-6, atol=0)
+    torch.testing.assert_close(scales_hip, scales_eager, rtol=1e-6, atol=0)
+    assert (q_hip.int() - q_eager.int()).abs().max().item() <= 1
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_convrot_int4_preserves_input_dtype_precision(hip, dtype):
+    """The W4A4 quantizer shares the dtype-correct fused rotation buffer."""
+    group = 16
+    weight = torch.zeros(2, 64, device=DEV, dtype=dtype)
+    weight[0, 0] = 1.001
+    weight[1, 16] = 3.141
+
+    q_hip, scales_hip = hip.quantize_convrot_w4a4_weight(weight, group)
+    with ck.use_backend("eager"):
+        q_eager, scales_eager = ck.quantize_convrot_w4a4_weight(weight, group)
+
+    assert torch.equal(q_hip, q_eager)
+    values = torch.stack((weight[0, 0], weight[1, 16]))
+    expected_rowmax = (values.float() * 0.25).to(dtype).float().abs()
+    torch.testing.assert_close(scales_hip * 7.0, expected_rowmax, rtol=1e-6, atol=0)
+    torch.testing.assert_close(scales_hip, scales_eager, rtol=2e-3, atol=0)
+
+
 @pytest.mark.parametrize("group_size", [16, 64, 256])
 def test_convrot_w4a4_weight_quant_close_to_eager(hip, group_size):
     """The fused rotation runs in fp32; eager rotates in the weight dtype.
@@ -293,7 +334,6 @@ def test_convrot_w4a4_weight_quant_close_to_eager(hip, group_size):
     Codes may therefore differ by one level, but no more.
     """
     torch.manual_seed(0)
-    from comfy_kitchen.backends.eager.convrot_w4a4 import _unpack_int4_row_major
 
     w = torch.randn(256, 1024, device=DEV, dtype=torch.bfloat16)
 
@@ -1319,18 +1359,19 @@ def test_rope_rejects_malformed_freqs(hip, shape, why):
         hip.apply_rope1(xq, freqs)
 
 
-def test_convrot_falls_back_to_eager_past_the_lds_bound(hip):
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_convrot_falls_back_to_eager_past_the_lds_bound(hip, dtype):
     """The fused rotation stages a whole row in LDS, so a large K does not fit.
 
     The launch does not fail cleanly past the budget, so the wrapper has to route
     those shapes to eager rather than reach the kernel.
     """
-    max_k = hip._C.convrot_max_k()
+    max_k = hip._C.convrot_max_k(hip.DTYPE_TO_CODE[dtype])
     assert max_k > 0
 
     k = (max_k + 1024) & ~63  # past the bound, still a multiple of the group size
-    x = torch.randn(2, k, device=DEV, dtype=torch.bfloat16)
-    h = torch.eye(64, device=DEV, dtype=torch.bfloat16)
+    x = torch.randn(2, k, device=DEV, dtype=dtype)
+    h = torch.eye(64, device=DEV, dtype=dtype)
 
     q, scales = hip.quantize_and_rotate_rowwise(x, h, 64)
     torch.cuda.synchronize()
@@ -1344,6 +1385,16 @@ def test_convrot_falls_back_to_eager_past_the_lds_bound(hip):
         hip._C.quantize_int8_convrot(
             hip._dl(x), hip._dl(qb), hip._dl(sb), 2, k, 64, 0, hip._stream(x)
         )
+
+
+def test_convrot_lds_bound_accounts_for_row_dtype(hip):
+    max_fp32 = hip._C.convrot_max_k(hip.DTYPE_TO_CODE[torch.float32])
+    max_fp16 = hip._C.convrot_max_k(hip.DTYPE_TO_CODE[torch.float16])
+    max_bf16 = hip._C.convrot_max_k(hip.DTYPE_TO_CODE[torch.bfloat16])
+
+    assert 0 < max_fp32 < max_fp16
+    assert max_fp16 == max_bf16
+    assert hip._C.convrot_max_k(99) == 0
 
 
 @pytest.mark.parametrize("group_size", [0, 32, 512])

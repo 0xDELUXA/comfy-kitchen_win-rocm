@@ -96,17 +96,19 @@ extern "C" void launch_convrot_quant_int4_kernel(
 
     using namespace comfy::hip_backend;
     check_convrot_group_size(group_size);
-    check_convrot_k(K, group_size);
+    check_convrot_k(K, group_size, in_code);
     if (M == 0) {
         return;  // a zero-block launch is hipErrorInvalidConfiguration
     }
-    const size_t shmem = static_cast<size_t>(K) * sizeof(__bf16);
-    convrot_quant_kernel<true><<<M, 256, shmem, stream>>>(
-        x, in_code, static_cast<int8_t*>(qout), static_cast<float*>(scales), M, K, group_size);
+    launch_convrot_quant<true>(
+        x, in_code, static_cast<int8_t*>(qout), static_cast<float*>(scales),
+        M, K, group_size, stream);
 }
 
 // The largest K the fused rotation can stage in LDS, for the dispatch wrappers.
-extern "C" int convrot_max_k_host() { return comfy::hip_backend::convrot_max_k(); }
+extern "C" int convrot_max_k_host(int in_code) {
+    return comfy::hip_backend::convrot_max_k(in_code);
+}
 
 extern "C" void launch_unpack_int4_kernel(
     const void* q, void* out, int64_t nbytes, hipStream_t stream) {

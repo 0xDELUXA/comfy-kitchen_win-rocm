@@ -101,18 +101,19 @@ extern "C" void launch_quantize_int8_convrot_kernel(
 
     using namespace comfy::hip_backend;
     check_convrot_group_size(group_size);
-    check_convrot_k(K, group_size);
+    check_convrot_k(K, group_size, in_code);
     check_convrot_act(act_code);
     if (M == 0) {
         return;  // a zero-block launch is hipErrorInvalidConfiguration
     }
-    const size_t shmem = static_cast<size_t>(K) * sizeof(__bf16);
     if (act_code == kActGeluTanh) {
-        convrot_quant_kernel<false, kActGeluTanh><<<M, 256, shmem, stream>>>(
-            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales), M, K, group_size);
+        launch_convrot_quant<false, kActGeluTanh>(
+            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
+            M, K, group_size, stream);
     } else {
-        convrot_quant_kernel<false, kActNone><<<M, 256, shmem, stream>>>(
-            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales), M, K, group_size);
+        launch_convrot_quant<false, kActNone>(
+            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
+            M, K, group_size, stream);
     }
 }
 
