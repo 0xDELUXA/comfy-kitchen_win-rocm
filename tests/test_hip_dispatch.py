@@ -155,7 +155,9 @@ def test_hip_drops_gemms_without_matrix_cores():
     assert not (hip_backend._WMMA_ONLY_OPS & set(without))
     # The elementwise kernels need no matrix cores and must survive.
     for op in ("apply_rope", "apply_rope_", "rms_rope", "rms_rope_split_half1_", "adaln",
-               "rms_adaln", "quantize_per_tensor_fp8", "gemv_awq_w4a16"):
+               "rms_adaln", "quantize_per_tensor_fp8", "gemv_awq_w4a16",
+               "dequantize_int8_simple_dtype",
+               "dequantize_int8_convrot_weight_dtype"):
         assert op in without
 
 

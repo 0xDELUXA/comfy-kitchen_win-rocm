@@ -28,7 +28,7 @@ from comfy_kitchen._rope_utils import check_rope_inplace
 from comfy_kitchen.backends import eager as _eager
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
 from comfy_kitchen.backends._activations import input_act_code as _input_act_code
-from comfy_kitchen.backends.eager.quantization import DTYPE_TO_CODE
+from comfy_kitchen.backends.eager.quantization import DTYPE_CODE_TO_DTYPE, DTYPE_TO_CODE
 
 logger = logging.getLogger("comfy_kitchen.hip")
 
@@ -48,6 +48,8 @@ __all__ = [
     "apply_rope_split_half1_",
     "convrot_w4a4_linear",
     "dequantize_convrot_w4a4_weight",
+    "dequantize_int8_convrot_weight_dtype",
+    "dequantize_int8_simple_dtype",
     "dequantize_per_tensor_fp8",
     "has_wmma",
     "int8_linear",
@@ -409,6 +411,75 @@ def quantize_int8_tensorwise(
         _dl(xc), _dl(q), _dl(out_scale.reshape(1)), _dl(scratch.reshape(1)), xc.numel(), _stream(x)
     )
     return q, out_scale
+
+
+def dequantize_int8_simple_dtype(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    """Dequantize INT8 values into a requested floating dtype."""
+    q = q.contiguous()
+    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    inner_dim = q.shape[-1] if q.dim() > 0 else 1
+
+    if scale.numel() == 1:
+        scale_mode = 0
+    elif tuple(scale.shape) == tuple(q.shape):
+        scale_mode = 1
+    elif (
+        q.dim() > 0
+        and scale.dim() == q.dim()
+        and tuple(scale.shape[:-1]) == tuple(q.shape[:-1])
+        and scale.shape[-1] == 1
+    ):
+        scale_mode = 2
+    else:
+        return _eager.dequantize_int8_simple_dtype(q, scale, output_dtype_code)
+
+    scale_arg = scale.to(device=q.device, dtype=torch.float32).contiguous()
+    output = torch.empty(q.shape, dtype=output_dtype, device=q.device)
+    _C.dequantize_int8_simple(
+        _dl(q),
+        _dl(scale_arg.reshape(-1)),
+        _dl(output),
+        inner_dim,
+        scale_mode,
+        _stream(q),
+    )
+    return output
+
+
+def dequantize_int8_convrot_weight_dtype(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    group_size: int,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    """Dequantize ConvRot INT8 weights and rotate them back to the original basis."""
+    if q.dim() != 2:
+        raise ValueError("ConvRot INT8 weight dequantization expects a 2D q tensor")
+
+    q_2d = q.contiguous()
+    m, k = q_2d.shape
+    output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    if group_size not in (16, 64, 256) or k % group_size != 0:
+        return _eager.dequantize_int8_convrot_weight_dtype(
+            q_2d, scale, group_size, output_dtype_code
+        )
+
+    scale_arg = scale.to(device=q.device, dtype=torch.float32).reshape(-1).contiguous()
+    output = torch.empty(q_2d.shape, dtype=output_dtype, device=q.device)
+    _C.dequantize_int8_convrot_weight(
+        _dl(q_2d),
+        _dl(scale_arg),
+        _dl(output),
+        m,
+        k,
+        group_size,
+        _stream(q),
+    )
+    return output
 
 
 # Keyed by device and dtype: convrot_max_k() reports the LDS budget of whichever
@@ -1227,6 +1298,25 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ),
         "quantize_int8_convrot_weight": FunctionConstraints(
             params={"weight": ParamConstraint(dtypes=floats)},
+            default_devices=dev,
+        ),
+        "dequantize_int8_simple_dtype": FunctionConstraints(
+            params={
+                "q": ParamConstraint(dtypes=frozenset({torch.int8})),
+                "scale": ParamConstraint(dtypes=floats),
+                "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=dev,
+        ),
+        "dequantize_int8_convrot_weight_dtype": FunctionConstraints(
+            params={
+                "q": ParamConstraint(
+                    dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)
+                ),
+                "scale": ParamConstraint(dtypes=floats),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "output_dtype_code": ParamConstraint(dtypes=frozenset({int})),
+            },
             default_devices=dev,
         ),
         # K must be a multiple of 16 so a WMMA K-step never straddles a row end.

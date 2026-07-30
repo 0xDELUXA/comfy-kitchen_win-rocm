@@ -29,6 +29,8 @@ Fast kernel library for Diffusion inference with multiple compute backends.
 | `quantize_int8_tensorwise`  | ✓     | ✓    |        | ✓   |
 | `quantize_and_rotate_rowwise` | ✓   | ✓    | ✓      | ✓   |
 | `quantize_int8_convrot_weight` | ✓  | ✓    |        | ✓   |
+| `dequantize_int8_simple_dtype` | ✓  | ✓    |        | ✓   |
+| `dequantize_int8_convrot_weight_dtype` | ✓ | ✓ |    | ✓   |
 | `int8_linear`               | ✓     | ✓    | ✓      | ✓   |
 | `gemv_awq_w4a16`            | ✓     | ✓    |        | ✓   |
 | `quantize_svdquant_w4a4`    | ✓     | ✓    |        | ✓   |
@@ -43,10 +45,10 @@ Each of the eight rope entries also has an in-place form (`apply_rope_`,
 ## HIP backend (AMD RDNA2 / RDNA3 / RDNA3.5 / RDNA4)
 
 The `hip` backend implements the quantized paths with its own kernels: WMMA
-matrix-core GEMMs on RDNA3/RDNA3.5/RDNA4, and non-WMMA kernels (quantizers, RoPE
-and the fused RMSNorm+RoPE, AdaLN and RMS-AdaLN, the AWQ GEMV) that also run on
-RDNA2. It does not link or call hipBLAS/hipBLASLt; every matmul is compiled from
-the sources in `comfy_kitchen/backends/hip/`.
+matrix-core GEMMs on RDNA3/RDNA3.5/RDNA4, and non-WMMA kernels (quantizers,
+INT8 dequantizers, RoPE and the fused RMSNorm+RoPE, AdaLN and RMS-AdaLN, the AWQ
+GEMV) that also run on RDNA2. It does not link or call hipBLAS/hipBLASLt; every
+matmul is compiled from the sources in `comfy_kitchen/backends/hip/`.
 
 Both rope kernels address their inputs through the tensor's own strides, so a q/k
 pair permuted or sliced out of a packed qkv is read where it lies rather than

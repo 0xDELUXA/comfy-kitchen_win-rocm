@@ -411,6 +411,96 @@ def test_quantize_int8_tensorwise_matches_eager():
     assert (q.int() - qe.int()).abs().max().item() <= 1
 
 
+@pytest.mark.parametrize(
+    ("scale_kind", "scale_shape"),
+    [
+        ("scalar", ()),
+        ("elementwise", (3, 4, 32)),
+        ("rowwise", (3, 4, 1)),
+    ],
+)
+@pytest.mark.parametrize(
+    ("output_dtype_code", "output_dtype"),
+    [(0, torch.float32), (1, torch.float16), (2, torch.bfloat16)],
+)
+def test_dequantize_int8_simple_dtype_matches_eager(
+    hip, scale_kind, scale_shape, output_dtype_code, output_dtype
+):
+    torch.manual_seed(0)
+    q = torch.randint(-128, 128, (3, 4, 32), dtype=torch.int8, device=DEV)
+    scale = torch.rand(scale_shape, dtype=torch.bfloat16, device=DEV) * 0.02
+
+    out = hip.dequantize_int8_simple_dtype(q, scale, output_dtype_code)
+    ref = (q.float() * scale).to(output_dtype)
+
+    assert out.dtype == output_dtype
+    assert torch.equal(out, ref), scale_kind
+
+
+@pytest.mark.parametrize("group_size", [16, 64, 256])
+@pytest.mark.parametrize("scale_kind", ["scalar", "rowwise"])
+@pytest.mark.parametrize(
+    ("output_dtype_code", "output_dtype"),
+    [(0, torch.float32), (1, torch.float16), (2, torch.bfloat16)],
+)
+def test_dequantize_int8_convrot_weight_dtype_matches_eager(
+    hip, group_size, scale_kind, output_dtype_code, output_dtype
+):
+    torch.manual_seed(0)
+    q = torch.randint(
+        -128, 128, (7, group_size * 2), dtype=torch.int8, device=DEV
+    )
+    scale_shape = () if scale_kind == "scalar" else (7, 1)
+    scale = torch.rand(scale_shape, dtype=torch.float16, device=DEV) * 0.02
+
+    out = hip.dequantize_int8_convrot_weight_dtype(
+        q, scale, group_size, output_dtype_code
+    )
+    with ck.use_backend("eager"):
+        ref = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight_dtype(
+            q, scale, group_size, output_dtype_code
+        )
+
+    assert out.dtype == output_dtype
+    torch.testing.assert_close(out.float(), ref.float(), rtol=2e-4, atol=2e-4)
+
+
+def test_int8_dtype_dequant_custom_ops_do_not_fall_back_to_eager(hip, monkeypatch):
+    def unexpected_eager(*args, **kwargs):
+        raise AssertionError("supported INT8 dequantization fell back to eager")
+
+    monkeypatch.setattr(
+        hip._eager, "dequantize_int8_simple_dtype", unexpected_eager
+    )
+    monkeypatch.setattr(
+        hip._eager, "dequantize_int8_convrot_weight_dtype", unexpected_eager
+    )
+
+    q = torch.randint(-128, 128, (5, 256), dtype=torch.int8, device=DEV)
+    scale = torch.rand(5, 1, dtype=torch.float32, device=DEV) * 0.02
+    with ck.use_backend("hip"):
+        simple = torch.ops.comfy_kitchen.dequantize_int8_simple_dtype(q, scale, 2)
+        convrot = torch.ops.comfy_kitchen.dequantize_int8_convrot_weight_dtype(
+            q, scale, 256, 2
+        )
+
+    assert simple.shape == q.shape
+    assert convrot.shape == q.shape
+    torch.cuda.synchronize()
+
+
+def test_int8_dtype_dequant_empty_inputs_do_not_launch_zero_grids(hip):
+    q = torch.empty(0, 256, dtype=torch.int8, device=DEV)
+    scale = torch.empty(0, 1, dtype=torch.float32, device=DEV)
+
+    simple = hip.dequantize_int8_simple_dtype(q, scale, 2)
+    convrot = hip.dequantize_int8_convrot_weight_dtype(q, scale, 256, 2)
+
+    assert simple.shape == q.shape
+    assert convrot.shape == q.shape
+    torch.cuda.synchronize()
+
+
 def test_fp8_quantize_dequantize_roundtrip():
     torch.manual_seed(0)
     x = torch.randn(128, 256, device=DEV, dtype=torch.bfloat16)

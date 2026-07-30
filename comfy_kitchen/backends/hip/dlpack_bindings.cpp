@@ -52,6 +52,10 @@ void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, int, in
                                          hipStream_t);
 void launch_quantize_int8_tensorwise_kernel(const void*, int, void*, void*, void*, int64_t,
                                             hipStream_t);
+void launch_dequantize_int8_simple_kernel(const void*, const void*, void*, int64_t, int64_t, int,
+                                          int, hipStream_t);
+void launch_dequantize_int8_convrot_weight_kernel(const void*, const void*, void*, int, int, int,
+                                                  int, int, hipStream_t);
 void launch_convrot_quant_int4_kernel(const void*, int, void*, void*, int, int, int, hipStream_t);
 void launch_unpack_int4_kernel(const void*, void*, int64_t, hipStream_t);
 int convrot_max_k_host(int);
@@ -419,6 +423,73 @@ void quantize_int8_tensorwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> sc
 
     launch_quantize_int8_tensorwise_kernel(x.data(), map_dtype_to_code(x.dtype()), q.data(),
                                            scale.data(), scratch.data(), numel, stream);
+    check_hip_launch();
+}
+
+void dequantize_int8_simple(nb::ndarray<> q, nb::ndarray<> scale, nb::ndarray<> out,
+                            int64_t inner_dim, int scale_mode, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "dequantize_int8_simple";
+    require_dtype(q, 4, 4, kFn, "q");
+    require_scale_len(scale, 0, kFn, "scale");
+    require_dtype(out, 0, 2, kFn, "out");
+    if (out.size() != q.size()) {
+        throw std::runtime_error(std::string(kFn) + ": output shape mismatch");
+    }
+    if (scale_mode < 0 || scale_mode > 2) {
+        throw std::runtime_error(std::string(kFn) + ": invalid scale mode");
+    }
+
+    const int64_t numel = static_cast<int64_t>(q.size());
+    if (numel > 0) {
+        if (inner_dim <= 0) {
+            throw std::runtime_error(std::string(kFn) + ": inner_dim must be positive");
+        }
+        size_t expected_scale = 1;
+        if (scale_mode == 1) {
+            expected_scale = q.size();
+        } else if (scale_mode == 2) {
+            if (numel % inner_dim != 0) {
+                throw std::runtime_error(
+                    std::string(kFn) + ": numel must be divisible by inner_dim");
+            }
+            expected_scale = static_cast<size_t>(numel / inner_dim);
+        }
+        if (scale.size() != expected_scale) {
+            throw std::runtime_error(
+                std::string(kFn) + ": scale has " + std::to_string(scale.size()) +
+                " elements, expected " + std::to_string(expected_scale));
+        }
+    }
+
+    launch_dequantize_int8_simple_kernel(
+        q.data(), scale.data(), out.data(), numel, inner_dim, scale_mode,
+        map_dtype_to_code(out.dtype()), reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void dequantize_int8_convrot_weight(nb::ndarray<> q, nb::ndarray<> scale, nb::ndarray<> out,
+                                    int M, int K, int group_size, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "dequantize_int8_convrot_weight";
+    require_nonneg(M, kFn, "M");
+    require_convrot_group(K, group_size, kFn);
+    require_dtype(q, 4, 4, kFn, "q");
+    require_scale_len(scale, 0, kFn, "scale");
+    require_dtype(out, 0, 2, kFn, "out");
+    require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
+    require_len(out, static_cast<int64_t>(M) * K, kFn, "out");
+    if (q.size() != out.size() ||
+        q.size() != static_cast<size_t>(static_cast<int64_t>(M) * K)) {
+        throw std::runtime_error(std::string(kFn) + ": input/output shape mismatch");
+    }
+    if (scale.size() != 1 && scale.size() != static_cast<size_t>(M)) {
+        throw std::runtime_error(
+            std::string(kFn) + ": scale must contain one value or one value per row");
+    }
+
+    launch_dequantize_int8_convrot_weight_kernel(
+        q.data(), scale.data(), out.data(), M, K, static_cast<int>(scale.size()),
+        group_size, map_dtype_to_code(out.dtype()),
+        reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -791,6 +862,8 @@ NB_MODULE(_C, m) {
     m.def("quantize_int8_rowwise", &quantize_int8_rowwise);
     m.def("quantize_int8_convrot", &quantize_int8_convrot);
     m.def("quantize_int8_tensorwise", &quantize_int8_tensorwise);
+    m.def("dequantize_int8_simple", &dequantize_int8_simple);
+    m.def("dequantize_int8_convrot_weight", &dequantize_int8_convrot_weight);
     m.def("convrot_quant_int4", &convrot_quant_int4);
     m.def("convrot_max_k", &convrot_max_k_host);
     m.def("unpack_int4", &unpack_int4);
