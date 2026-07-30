@@ -336,3 +336,9 @@ def test_combined_wheel_cache_keys_include_hip_sources():
 
     assert len(combined_cache_keys) == 2
     assert all("'comfy_kitchen/backends/hip/**'" in key for key in combined_cache_keys)
+    windows_key = next(key for key in combined_cache_keys if "windows-x86_64" in key)
+    assert "py${{ matrix.python-version }}" in windows_key
+    versioned_windows_prefix = (
+        "ccache-windows-x86_64-cuda13-py${{ matrix.python-version }}-"
+    )
+    assert workflow.count(versioned_windows_prefix) == 2  # primary key + restore prefix

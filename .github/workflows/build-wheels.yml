@@ -366,8 +366,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ccache
-          key: ccache-windows-x86_64-cuda13-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'comfy_kitchen/backends/hip/**', 'third_party/cutlass/.git') }}
+          key: ccache-windows-x86_64-cuda13-py${{ matrix.python-version }}-${{ hashFiles('setup.py', 'comfy_kitchen/backends/cuda/**', 'comfy_kitchen/backends/hip/**', 'third_party/cutlass/.git') }}
           restore-keys: |
+            ccache-windows-x86_64-cuda13-py${{ matrix.python-version }}-
             ccache-windows-x86_64-cuda13-
 
       - name: Install compiler cache and Ninja
