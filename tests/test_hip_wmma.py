@@ -228,6 +228,70 @@ def test_int8_linear_input_act_matches_the_eager_chain(tag, shape, kwargs):
     assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale, tag
 
 
+def _swiglu(x):
+    gate, up = x.chunk(2, dim=-1)
+    return torch.nn.functional.silu(gate) * up
+
+
+# swiglu is the gated pair: the input row is [gate | up] and the quantized row is
+# half as wide, so the shapes below give the raw (2 * K) width.
+@needs_wmma
+@pytest.mark.parametrize(
+    ("tag", "shape", "kwargs"),
+    [
+        ("fused convrot", (256, 2 * 1024), {"convrot": True, "convrot_groupsize": 256}),
+        ("no convrot", (256, 2 * 1024), {"convrot": False}),
+        ("m == 1", (1, 2 * 1024), {"convrot": True, "convrot_groupsize": 256}),
+    ],
+)
+def test_int8_linear_swiglu_matches_the_eager_chain(tag, shape, kwargs):
+    """int8_linear(x, input_act="swiglu") == int8_linear(swiglu(x)) on every route."""
+    torch.manual_seed(0)
+    m, k2 = shape
+    k = k2 // 2
+    n = 256
+    x = torch.randn(m, k2, device=DEV, dtype=torch.bfloat16)
+    w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16)
+    wq, ws = ck.quantize_int8_rowwise(w)
+    ws = ws.reshape(-1)
+
+    with ck.use_backend("hip"):
+        ref = ck.int8_linear(_swiglu(x), wq, ws, None, torch.bfloat16, **kwargs)
+        out = ck.int8_linear(x, wq, ws, None, torch.bfloat16,
+                             input_act="swiglu", **kwargs)
+
+    assert out.shape == (m, n), tag
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale, tag
+
+
+@needs_wmma
+def test_swiglu_quantizer_is_at_least_as_accurate_as_the_chain(hip):
+    """Fusing the gate into the rotation's load must not lose accuracy against
+    materializing silu(gate) * up in bf16 first."""
+    torch.manual_seed(0)
+    m, k, group = 512, 1024, 256
+    x = torch.randn(m, 2 * k, device=DEV, dtype=torch.bfloat16) * 2.0
+
+    xd = x.double()
+    activated = torch.nn.functional.silu(xd[:, :k]) * xd[:, k:]
+    mat = _build_hadamard(group, device=x.device, dtype=torch.float64)
+    rotated = (activated.reshape(-1, k // group, group) @ mat).reshape(-1, k)
+    scale = (rotated.abs().amax(-1, keepdim=True) / 127.0).clamp(min=1e-30)
+    exact = (rotated / scale).round().clamp(-128, 127)
+
+    chain_q, _ = hip._rotate_quant_int8(_swiglu(x).contiguous(), group)
+    fused_q, fused_s = hip._rotate_quant_int8(x, group, "swiglu")
+
+    err_chain = (chain_q.double() - exact).abs().mean().item()
+    err_fused = (fused_q.double() - exact).abs().mean().item()
+    assert err_fused <= max(err_chain * 1.05, 1e-4), (
+        f"fused ({err_fused:.6f}) less accurate than chain ({err_chain:.6f})"
+    )
+    assert fused_q.shape == (m, k)
+    assert fused_s.shape == (m,)
+
+
 @needs_wmma
 def test_int8_linear_input_act_none_is_the_identity():
     """None and "none" must be bit-identical to omitting the argument."""
@@ -736,6 +800,144 @@ def test_rms_rope_matches_eager(split_half, freqs_dtype, shape, freqs_shape):
     assert torch.equal(out_one, out_q)
 
 
+def _partial_rotary_reference(x, freqs, scale, epsilon, rot_dim):
+    """Norm over the full head_dim, split-half rotation over the first rot_dim."""
+    x_float = x.float()
+    rrms = torch.rsqrt(x_float.square().mean(dim=-1, keepdim=True) + epsilon)
+    x_norm = (x_float * rrms * scale.float()).to(x.dtype).float()
+    half = rot_dim // 2
+    x1, x2 = x_norm[..., :half], x_norm[..., half:rot_dim]
+    f = freqs.float()
+    o1 = f[..., 0, 0] * x1 + f[..., 0, 1] * x2
+    o2 = f[..., 1, 0] * x1 + f[..., 1, 1] * x2
+    return torch.cat([o1, o2, x_norm[..., rot_dim:]], dim=-1).to(x.dtype)
+
+
+@pytest.mark.parametrize("rot_dim", [32, 64, 96])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+def test_rms_rope_partial_rotary(hip, rot_dim, dtype):
+    """rot_dim rotates a head-dim prefix; the tail is normalized but not rotated."""
+    torch.manual_seed(0)
+    s, h, d = 333, 8, 128
+    q = torch.randn(1, s, h, d, device=DEV, dtype=dtype)
+    k = torch.randn(1, s, h, d, device=DEV, dtype=dtype)
+    freqs = torch.randn(1, s, 1, rot_dim // 2, 2, 2, device=DEV, dtype=torch.float32)
+    q_scale = torch.randn(d, device=DEV, dtype=torch.float32)
+    k_scale = torch.randn(d, device=DEV, dtype=torch.float32)
+
+    out_q, out_k = hip.rms_rope_split_half(q, k, freqs, q_scale, k_scale, rot_dim=rot_dim)
+
+    for out, x, scale in ((out_q, q, q_scale), (out_k, k, k_scale)):
+        ref = _partial_rotary_reference(x, freqs, scale, 1e-6, rot_dim)
+        torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+
+
+def test_rms_rope_partial_rotary_with_an_odd_tail(hip, monkeypatch):
+    """Only the rotated prefix has to be even. A 65-wide row with rot_dim=64 leaves
+    one norm-only element, which the kernel handles, so it must not go to eager."""
+    monkeypatch.setattr(
+        hip._eager, "rms_rope_split_half",
+        lambda *a, **kw: pytest.fail("an odd head_dim with an even rot_dim fell back"),
+    )
+    torch.manual_seed(0)
+    s, h, d, rot_dim = 64, 4, 65, 64
+    q = torch.randn(1, s, h, d, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(1, s, h, d, device=DEV, dtype=torch.bfloat16)
+    freqs = torch.randn(1, s, 1, rot_dim // 2, 2, 2, device=DEV, dtype=torch.float32)
+    scale = torch.randn(d, device=DEV, dtype=torch.float32)
+
+    out_q, out_k = hip.rms_rope_split_half(q, k, freqs, scale, scale, rot_dim=rot_dim)
+
+    for out, x in ((out_q, q), (out_k, k)):
+        ref = _partial_rotary_reference(x, freqs, scale, 1e-6, rot_dim)
+        torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+
+
+def test_rms_rope_full_rot_dim_matches_the_default(hip):
+    """rot_dim == head_dim must be bit-identical to omitting it."""
+    torch.manual_seed(0)
+    s, h, d = 128, 4, 64
+    q = torch.randn(1, s, h, d, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(1, s, h, d, device=DEV, dtype=torch.bfloat16)
+    freqs = torch.randn(1, s, 1, d // 2, 2, 2, device=DEV, dtype=torch.float32)
+    scale = torch.randn(d, device=DEV, dtype=torch.float32)
+
+    full = hip.rms_rope_split_half(q, k, freqs, scale, scale, rot_dim=d)
+    default = hip.rms_rope_split_half(q, k, freqs, scale, scale)
+
+    assert torch.equal(full[0], default[0])
+    assert torch.equal(full[1], default[1])
+
+
+def test_rms_rope_partial_rotary_in_place_on_a_qkv_slice(hip):
+    """The MiniMax layout: q and k are strided slices of one packed projection."""
+    torch.manual_seed(0)
+    s, h, d, rot_dim = 96, 6, 128, 96
+    qkv = torch.randn(s, 3 * h * d, device=DEV, dtype=torch.bfloat16)
+    qkv_ref = qkv.clone()
+    freqs = torch.randn(1, s, 1, rot_dim // 2, 2, 2, device=DEV, dtype=torch.float32)
+    scale = torch.randn(d, device=DEV, dtype=torch.float32)
+
+    q, k, v = (t.view(1, s, h, d) for t in qkv.split(h * d, dim=-1))
+    q_ref, k_ref, v_ref = (t.view(1, s, h, d) for t in qkv_ref.split(h * d, dim=-1))
+
+    hip.rms_rope_split_half_(q, k, freqs, scale, scale, rot_dim=rot_dim)
+    expect_q, expect_k = hip.rms_rope_split_half(
+        q_ref, k_ref, freqs, scale, scale, rot_dim=rot_dim)
+
+    assert torch.equal(q, expect_q)
+    assert torch.equal(k, expect_k)
+    assert torch.equal(v, v_ref), "v must not be touched by in-place q/k rope"
+
+
+@pytest.mark.parametrize("rot_dim", [33, 66], ids=["odd", "over head_dim"])
+def test_rms_rope_rejects_an_unusable_rot_dim(hip, rot_dim):
+    """The rotation pairs (i, i + rot_dim/2) inside head_dim, so an odd prefix or
+    one wider than the row has no kernel."""
+    q = torch.randn(1, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(1, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
+    freqs = torch.randn(1, 8, 1, rot_dim // 2, 2, 2, device=DEV, dtype=torch.float32)
+    scale = torch.randn(64, device=DEV, dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="rot_dim"):
+        hip.rms_rope_split_half(q, k, freqs, scale, scale, rot_dim=rot_dim)
+
+
+def test_rms_rope_forwards_rot_dim_to_the_eager_fallback(hip, monkeypatch):
+    """A weight the kernel cannot index goes back to eager, which must still be
+    told the rotation is partial: dropping rot_dim there rotates the whole row."""
+    q = torch.randn(1, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(1, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
+    freqs = torch.randn(1, 8, 1, 24, 2, 2, device=DEV, dtype=torch.float32)
+    scale = torch.randn(1, 64, device=DEV, dtype=torch.float32)  # 2D: no kernel
+
+    seen = {}
+    monkeypatch.setattr(
+        hip._eager, "rms_rope_split_half",
+        lambda *a, **kw: seen.update(kw) or (torch.zeros_like(q), torch.zeros_like(k)),
+    )
+    hip.rms_rope_split_half(q, k, freqs, scale, scale, rot_dim=48)
+
+    assert seen.get("rot_dim") == 48, "eager fallback lost rot_dim"
+
+
+def test_rms_rope_partial_rotary_with_mismatched_q_k_heads(hip):
+    """GQA splits the pair into two single-tensor launches; both need rot_dim."""
+    torch.manual_seed(0)
+    s, d, rot_dim = 65, 128, 96
+    q = torch.randn(1, s, 8, d, device=DEV, dtype=torch.bfloat16)
+    k = torch.randn(1, s, 2, d, device=DEV, dtype=torch.bfloat16)
+    freqs = torch.randn(1, s, 1, rot_dim // 2, 2, 2, device=DEV, dtype=torch.float32)
+    q_scale = torch.randn(d, device=DEV, dtype=torch.float32)
+    k_scale = torch.randn(d, device=DEV, dtype=torch.float32)
+
+    out_q, out_k = hip.rms_rope_split_half(q, k, freqs, q_scale, k_scale, rot_dim=rot_dim)
+
+    for out, x, scale in ((out_q, q, q_scale), (out_k, k, k_scale)):
+        ref = _partial_rotary_reference(x, freqs, scale, 1e-6, rot_dim)
+        torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+
+
 @pytest.mark.parametrize("split_half", [False, True])
 def test_rms_rope_reads_a_qkv_slice_in_place(hip, split_half):
     """A q/k pair sliced out of a packed qkv must match the copy bit for bit."""
@@ -827,7 +1029,7 @@ def test_rms_rope_rejects_a_short_weight(hip):
             q.__dlpack__(stream=-1), None, freqs.__dlpack__(stream=-1),
             torch.randn(32, device=DEV).__dlpack__(stream=-1), None,
             q_out.__dlpack__(stream=-1), None,
-            1e-6, False, torch.cuda.current_stream(q.device).cuda_stream,
+            1e-6, False, torch.cuda.current_stream(q.device).cuda_stream, 0,
         )
 
 

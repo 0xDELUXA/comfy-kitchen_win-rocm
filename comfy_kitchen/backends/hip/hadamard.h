@@ -83,11 +83,13 @@ __forceinline__ __device__ float load_in(const void* x, int64_t idx, int code) {
     return static_cast<float>(static_cast<const __bf16*>(x)[idx]);
 }
 
-// Codes match comfy_kitchen.backends._activations.INPUT_ACT_TO_CODE.
-enum : int { kActNone = 0, kActGeluTanh = 1 };
+// Codes match comfy_kitchen.backends._activations.INPUT_ACT_TO_CODE. SwiGLU is
+// the gated pair: the raw row is [gate | up] (2*K wide) and the activated row
+// silu(gate) * up is K wide; the others are elementwise.
+enum : int { kActNone = 0, kActGeluTanh = 1, kActSwiGLU = 2 };
 
 inline void check_convrot_act(int act) {
-    if (act != kActNone && act != kActGeluTanh) {
+    if (act != kActNone && act != kActGeluTanh && act != kActSwiGLU) {
         throw std::runtime_error("convrot: unsupported input activation code");
     }
 }
@@ -101,6 +103,22 @@ __forceinline__ __device__ float apply_input_act(float v) {
         return 0.5f * v * (1.0f + tanhf(kBeta * (v + kKappa * v * v * v)));
     }
     return v;
+}
+
+// One activated value: column `col` of the K-wide activated row starting at
+// `in_row`. SwiGLU reads the gate at col and the up at K + col; every other
+// activation reads the same K-wide row it writes.
+template <int ACT>
+__forceinline__ __device__ float load_input_act(
+    const void* x, int64_t in_row, int col, int K, int code) {
+    if constexpr (ACT == kActSwiGLU) {
+        // Matches torch silu(gate) * up.
+        const float gate = load_in(x, in_row + col, code);
+        const float up = load_in(x, in_row + K + col, code);
+        return (gate / (1.0f + expf(-gate))) * up;
+    } else {
+        return apply_input_act<ACT>(load_in(x, in_row + col, code));
+    }
 }
 
 template <typename RowT>
@@ -147,15 +165,15 @@ __global__ __launch_bounds__(256) void convrot_quant_kernel(
     const int gbase_idx = glocal * G;
     const float norm = rsqrtf(static_cast<float>(G));
     const int ngrp = K / G;
+    // SwiGLU reads a [gate | up] raw row twice as wide as the K it writes.
+    constexpr int kInWidth = (ACT == kActSwiGLU) ? 2 : 1;
+    const int64_t in_row = static_cast<int64_t>(row) * K * kInWidth;
 
     float lmax = 0.0f;
     for (int gbase = 0; gbase < ngrp; gbase += gpw) {
         const int grp = gbase + glocal;
         const bool active = grp < ngrp;
-        g[t] = active ? apply_input_act<ACT>(load_in(
-                            x, static_cast<int64_t>(row) * K + static_cast<int64_t>(grp) * G + e,
-                            in_dtype))
-                      : 0.0f;
+        g[t] = active ? load_input_act<ACT>(x, in_row, grp * G + e, K, in_dtype) : 0.0f;
         __syncthreads();
 
         for (int stage = 0; stage < nstages; ++stage) {

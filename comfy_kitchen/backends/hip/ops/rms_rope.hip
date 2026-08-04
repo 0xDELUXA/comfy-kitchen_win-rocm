@@ -28,7 +28,7 @@ __global__ __launch_bounds__(kRmsRopeThreads) void rms_rope_kernel(
     const void* __restrict__ q, const void* __restrict__ k,
     const void* __restrict__ freqs, const void* __restrict__ q_scale,
     const void* __restrict__ k_scale, T* __restrict__ q_out, T* __restrict__ k_out,
-    int64_t dim1, int64_t dim2, int head_dim,
+    int64_t dim1, int64_t dim2, int head_dim, int rot_dim,
     int64_t fb, int64_t fd1, int64_t fd2,
     int64_t sx_b, int64_t sx_d1, int64_t sx_d2, int64_t sx_d,
     int64_t so_b, int64_t so_d1, int64_t so_d2, int64_t so_d,
@@ -80,7 +80,9 @@ __global__ __launch_bounds__(kRmsRopeThreads) void rms_rope_kernel(
     const int64_t foff_row = (fb == 1 ? 0 : b) * sf_b + (fd1 == 1 ? 0 : d1) * sf_d1 +
                              (fd2 == 1 ? 0 : d2) * sf_d2;
 
-    const int n_pairs = head_dim / 2;
+    // Rotation covers the first rot_dim dims, in split-half pairs (p, p + rot_dim/2);
+    // the reduction above always spans the full head_dim.
+    const int n_pairs = rot_dim / 2;
     for (int p = t; p < n_pairs; p += kRmsRopeThreads) {
         const int64_t ia = split_half ? p : 2 * p;
         const int64_t ib = split_half ? p + n_pairs : 2 * p + 1;
@@ -111,6 +113,18 @@ __global__ __launch_bounds__(kRmsRopeThreads) void rms_rope_kernel(
             rope_store<T>(k_out, ib_out, rope_combine(f10, ka, f11, kb, f_code, split_half));
         }
     }
+
+    // Dims past rot_dim are normalized and scaled but never rotated. The store
+    // rounds to T, which is the single rounding eager's rms_norm applies. Empty
+    // when rot_dim == head_dim.
+    for (int d = rot_dim + t; d < head_dim; d += kRmsRopeThreads) {
+        const int64_t in = xoff + d * sx_d;
+        const int64_t out = ooff + d * so_d;
+        rope_store<T>(q_out, out, load_in(q, in, x_code) * rrms_q * load_in(q_scale, d, s_code));
+        if (has_k) {
+            rope_store<T>(k_out, out, load_in(k, in, x_code) * rrms_k * load_in(k_scale, d, s_code));
+        }
+    }
 }
 
 }  // namespace comfy::hip_backend
@@ -118,7 +132,7 @@ __global__ __launch_bounds__(kRmsRopeThreads) void rms_rope_kernel(
 extern "C" void launch_rms_rope_kernel(
     const void* q, const void* k, const void* freqs, const void* q_scale, const void* k_scale,
     void* q_out, void* k_out,
-    int64_t batch, int64_t dim1, int64_t dim2, int64_t head_dim,
+    int64_t batch, int64_t dim1, int64_t dim2, int64_t head_dim, int64_t rot_dim,
     int64_t fb, int64_t fd1, int64_t fd2,
     int64_t sx_b, int64_t sx_d1, int64_t sx_d2, int64_t sx_d,
     int64_t so_b, int64_t so_d1, int64_t so_d2, int64_t so_d,
@@ -135,11 +149,17 @@ extern "C" void launch_rms_rope_kernel(
     if (rows > 0xffffffffLL) {
         throw std::runtime_error("rms_rope: too many rows for a single grid");
     }
+    // 0 rotates everything; anything else is a partial-rotary prefix.
+    const int64_t rot = rot_dim > 0 ? rot_dim : head_dim;
+    if (rot % 2 != 0 || rot > head_dim) {
+        throw std::runtime_error("rms_rope: rot_dim must be even and <= head_dim");
+    }
 
 #define CK_RMS_ROPE_LAUNCH(T)                                                                  \
     rms_rope_kernel<T><<<static_cast<unsigned int>(rows), kRmsRopeThreads, 0, stream>>>(       \
         q, k, freqs, q_scale, k_scale, static_cast<T*>(q_out), static_cast<T*>(k_out), dim1,   \
-        dim2, static_cast<int>(head_dim), fb, fd1, fd2, sx_b, sx_d1, sx_d2, sx_d, so_b, so_d1, \
+        dim2, static_cast<int>(head_dim), static_cast<int>(rot), fb, fd1, fd2, sx_b, sx_d1,    \
+        sx_d2, sx_d, so_b, so_d1,                                                              \
         so_d2, so_d, sf_b, sf_d1, sf_d2, sf_d, sf_rot, sf_pair, x_code, f_code, s_code,        \
         epsilon, split_half)
 
