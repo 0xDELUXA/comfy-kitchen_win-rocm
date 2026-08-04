@@ -188,7 +188,8 @@ extern "C" void launch_quantize_int8_rowwise_kernel(
         x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales), M, K);
 }
 
-// Fused ConvRot rotation + rowwise int8 quantize. act_code: 0 none, 1 gelu tanh.
+// Fused ConvRot rotation + rowwise int8 quantize. act_code: 0 none, 1 gelu tanh,
+// 2 swiglu. K is the activated (written) width; swiglu reads a row twice as wide.
 extern "C" void launch_quantize_int8_convrot_kernel(
     const void* x, int in_code, void* q, void* scales,
     int M, int K, int group_size, int act_code, hipStream_t stream) {
@@ -202,6 +203,10 @@ extern "C" void launch_quantize_int8_convrot_kernel(
     }
     if (act_code == kActGeluTanh) {
         launch_convrot_quant<false, kActGeluTanh>(
+            x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
+            M, K, group_size, stream);
+    } else if (act_code == kActSwiGLU) {
+        launch_convrot_quant<false, kActSwiGLU>(
             x, in_code, static_cast<int8_t*>(q), static_cast<float*>(scales),
             M, K, group_size, stream);
     } else {

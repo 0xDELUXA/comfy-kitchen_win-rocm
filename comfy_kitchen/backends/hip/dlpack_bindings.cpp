@@ -78,8 +78,8 @@ void launch_apply_rope_kernel(const void*, const void*, const void*, void*, void
 void launch_rms_rope_kernel(const void*, const void*, const void*, const void*, const void*, void*,
                             void*, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int, int, int,
-                            float, bool, hipStream_t);
+                            int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int, int,
+                            int, float, bool, hipStream_t);
 }
 
 static void check_hip_launch() {
@@ -391,7 +391,10 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
     require_convrot_group(K, group_size, kFn);
     require_dtype(x, 0, 2, kFn, "x");
     require_dtype(q, 4, 4, kFn, "q");
-    require_len(x, static_cast<int64_t>(M) * K, kFn, "x");
+    // K is the activated (written) width; swiglu (code 2, see INPUT_ACT_TO_CODE)
+    // reads a [gate | up] row twice as wide. The launcher rejects unknown codes.
+    const int64_t in_width = act_code == 2 ? 2 : 1;
+    require_len(x, static_cast<int64_t>(M) * K * in_width, kFn, "x");
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
 
@@ -571,27 +574,35 @@ void rms_adaln(nb::ndarray<> x, nb::ndarray<> scale, nb::ndarray<> shift, nb::nd
                /*subtract_mean=*/false, stream_ptr);
 }
 
-// x is (batch, dim1, dim2, head_dim); freqs is (fb, fd1, fd2, head_dim/2, 2, 2).
+// x is (batch, dim1, dim2, head_dim); freqs is (fb, fd1, fd2, rot_dim/2, 2, 2).
 // Shapes and strides are read off the arrays so the broadcast rules stay in one
 // place rather than being recomputed on the Python side. Shared by apply_rope and
-// rms_rope, which index both tensors the same way.
-static void require_rope_shapes(const nb::ndarray<>& x, const nb::ndarray<>& freqs,
-                                const char* fn) {
+// rms_rope, which index both tensors the same way. rot_dim is the rotated head-dim
+// prefix; 0 rotates everything.
+static int64_t require_rope_shapes(const nb::ndarray<>& x, const nb::ndarray<>& freqs,
+                                   const char* fn, int64_t rot_dim = 0) {
     // map_dtype_to_code returns -1 for anything else, which the device decoder
     // would misread; the other operands are checked against x's dtype separately.
     require_dtype(x, 0, 2, fn, "x");
     require_dtype(freqs, 0, 2, fn, "freqs_cis");
     if (x.ndim() != 4) throw std::runtime_error(std::string(fn) + " expects a 4D input");
     if (freqs.ndim() != 6) throw std::runtime_error(std::string(fn) + " expects a 6D freqs_cis");
-    if (x.shape(3) % 2 != 0) {
-        throw std::runtime_error(std::string(fn) + " expects an even head_dim");
+
+    // Only the rotated prefix is paired, so an odd head_dim is fine as long as the
+    // resolved rot is even: the leftover tail is norm-only. apply_rope stays
+    // covered because its rot resolves to head_dim.
+    const int64_t head_dim = static_cast<int64_t>(x.shape(3));
+    const int64_t rot = rot_dim > 0 ? rot_dim : head_dim;
+    if (rot % 2 != 0 || rot > head_dim) {
+        throw std::runtime_error(std::string(fn) + " expects an even rot_dim <= head_dim");
     }
 
-    // The kernel indexes freqs as (fb, fd1, fd2, head_dim/2, 2, 2), broadcasting a
+    // The kernel indexes freqs as (fb, fd1, fd2, rot_dim/2, 2, 2), broadcasting a
     // leading dim only when it is 1. Anything else walks off the end of the array.
-    if (freqs.shape(3) != x.shape(3) / 2 || freqs.shape(4) != 2 || freqs.shape(5) != 2) {
+    if (freqs.shape(3) != static_cast<size_t>(rot / 2) || freqs.shape(4) != 2 ||
+        freqs.shape(5) != 2) {
         throw std::runtime_error(std::string(fn) +
-                                 " expects freqs_cis trailing dims (head_dim/2, 2, 2)");
+                                 " expects freqs_cis trailing dims (rot_dim/2, 2, 2)");
     }
     for (size_t i = 0; i < 3; ++i) {
         if (freqs.shape(i) != 1 && freqs.shape(i) != x.shape(i)) {
@@ -600,6 +611,7 @@ static void require_rope_shapes(const nb::ndarray<>& x, const nb::ndarray<>& fre
                 " expects each leading freqs_cis dim to be 1 or match the input");
         }
     }
+    return rot;
 }
 
 // An output is walked with its own strides, so it only has to match the extents.
@@ -670,9 +682,9 @@ void apply_rope(nb::ndarray<> xq, OptArray xk, nb::ndarray<> freqs, nb::ndarray<
 // weight for each input.
 void rms_rope(nb::ndarray<> q, OptArray k, nb::ndarray<> freqs, nb::ndarray<> q_scale,
               OptArray k_scale, nb::ndarray<> q_out, OptArray k_out, float epsilon,
-              bool split_half, uintptr_t stream_ptr) {
+              bool split_half, uintptr_t stream_ptr, int64_t rot_dim) {
     constexpr const char* kFn = "rms_rope";
-    require_rope_shapes(q, freqs, kFn);
+    const int64_t rot = require_rope_shapes(q, freqs, kFn, rot_dim);
 
     // k, its scale and its output are one operand set.
     if (k.has_value() != k_out.has_value() || k.has_value() != k_scale.has_value()) {
@@ -701,7 +713,7 @@ void rms_rope(nb::ndarray<> q, OptArray k, nb::ndarray<> freqs, nb::ndarray<> q_
         k_scale.has_value() ? k_scale->data() : nullptr, q_out.data(),
         k_out.has_value() ? k_out->data() : nullptr,
         static_cast<int64_t>(q.shape(0)), static_cast<int64_t>(q.shape(1)),
-        static_cast<int64_t>(q.shape(2)), head_dim,
+        static_cast<int64_t>(q.shape(2)), head_dim, rot,
         static_cast<int64_t>(freqs.shape(0)), static_cast<int64_t>(freqs.shape(1)),
         static_cast<int64_t>(freqs.shape(2)),
         static_cast<int64_t>(q.stride(0)), static_cast<int64_t>(q.stride(1)),

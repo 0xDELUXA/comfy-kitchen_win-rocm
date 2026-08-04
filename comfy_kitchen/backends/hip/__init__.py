@@ -28,6 +28,8 @@ from comfy_kitchen._rope_utils import check_rope_inplace, trim_rope_freqs
 from comfy_kitchen.backends import eager as _eager
 from comfy_kitchen.backends._activations import apply_input_act as _apply_input_act
 from comfy_kitchen.backends._activations import input_act_code as _input_act_code
+from comfy_kitchen.backends._activations import input_act_width as _input_act_width
+from comfy_kitchen.backends.eager import rope as _eager_rope
 from comfy_kitchen.backends.eager.quantization import DTYPE_CODE_TO_DTYPE, DTYPE_TO_CODE
 
 logger = logging.getLogger("comfy_kitchen.hip")
@@ -522,7 +524,9 @@ def _convrot_supported(
 def _rotate_quant_int8(
     x2d: torch.Tensor, group_size: int, input_act: str | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    m, k = x2d.shape
+    m, k_in = x2d.shape
+    # swiglu halves the row: the [gate | up] input is twice the quantized width.
+    k = k_in // _input_act_width(input_act)
     q = torch.empty((m, k), dtype=torch.int8, device=x2d.device)
     scales = torch.empty((m,), dtype=torch.float32, device=x2d.device)
     # check_convrot_k queries the current device's LDS budget, so pin it to the
@@ -593,14 +597,11 @@ def int8_linear(
     """INT8 linear with dynamic row-wise activation quantization, on WMMA."""
     # Rejected here so every route fails the same way, not just the fused one.
     _input_act_code(input_act)
-    if input_act == "swiglu":
-        # The WMMA quantizer does not fuse the gated pair; apply it eagerly so
-        # the row width and result match the fused backends.
-        x = _apply_input_act(x, input_act)
-        input_act = None
-    if x.shape[-1] != weight.shape[-1]:
+    # k_act is the activated (quantized) row width: swiglu halves the raw row.
+    k_act = x.shape[-1] // _input_act_width(input_act)
+    if k_act != weight.shape[-1]:
         raise ValueError(
-            f"Input and weight inner dimensions must match, got {x.shape[-1]} and {weight.shape[-1]}"
+            f"Input and weight inner dimensions must match, got {k_act} and {weight.shape[-1]}"
         )
 
     weight = _aligned(weight.to(device=x.device).contiguous())
@@ -612,7 +613,8 @@ def int8_linear(
 
     orig_shape = x.shape
     x2d = x.reshape(-1, orig_shape[-1]).contiguous()
-    m, k = x2d.shape
+    m = x2d.shape[0]
+    k = k_act
     n = weight.shape[0]
 
     # The WMMA K-step and the small-M GEMV both read a row 16 bytes at a time.
@@ -1100,7 +1102,7 @@ def _rms_rope_weight(scale: torch.Tensor, head_dim: int) -> torch.Tensor | None:
     return scale.contiguous()
 
 
-def _rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=False):
+def _rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=False, rot_dim=0):
     if k is not None and k_scale is None:
         k_scale = q_scale
     # One dtype code and one stream are passed for the whole launch, so every
@@ -1119,11 +1121,19 @@ def _rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=Fa
         # No fused path; eager returns fresh tensors, so in place they are
         # written back through the views.
         if k is None:
-            impl = _eager.rms_rope_split_half1 if split_half else _eager.rms_rope1
-            out = impl(q, freqs_cis, q_scale, epsilon)
+            if rot_dim:
+                # Only the private eager helper takes rot_dim for a single tensor.
+                out = _eager_rope._rms_rope1(
+                    q, freqs_cis, q_scale, epsilon, split_half=split_half, rot_dim=rot_dim)
+            else:
+                impl = _eager.rms_rope_split_half1 if split_half else _eager.rms_rope1
+                out = impl(q, freqs_cis, q_scale, epsilon)
             return (q.copy_(out) if inplace else out), None
+        # Only the split-half pair takes rot_dim upstream; rot_dim never reaches
+        # the interleaved path, which has no public rot_dim argument.
         impl = _eager.rms_rope_split_half if split_half else _eager.rms_rope
-        q_out, k_out = impl(q, k, freqs_cis, q_scale, k_scale, epsilon)
+        kwargs = {"rot_dim": rot_dim} if rot_dim and split_half else {}
+        q_out, k_out = impl(q, k, freqs_cis, q_scale, k_scale, epsilon, **kwargs)
         if inplace:
             return q.copy_(q_out), k.copy_(k_out)
         return q_out, k_out
@@ -1142,12 +1152,13 @@ def _rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=Fa
         _dl(q), None if k is None else _dl(k), _dl(freqs_cis),
         _dl(q_weight), None if k_weight is None else _dl(k_weight),
         _dl(q_out), None if k_out is None else _dl(k_out),
-        epsilon, split_half, _stream(q),
+        epsilon, split_half, _stream(q), rot_dim,
     )
     return q_out, k_out
 
 
-def _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=False):
+def _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace=False,
+                   rot_dim=0):
     if k_scale is None:
         k_scale = q_scale
     # One dtype code covers both inputs and one more both weights, so a difference
@@ -1159,10 +1170,12 @@ def _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inpla
         or (inplace and _effective_strides(q) != _effective_strides(k))
     ):
         return (
-            _rms_rope(q, None, freqs_cis, q_scale, None, epsilon, split_half, inplace)[0],
-            _rms_rope(k, None, freqs_cis, k_scale, None, epsilon, split_half, inplace)[0],
+            _rms_rope(q, None, freqs_cis, q_scale, None, epsilon, split_half, inplace,
+                      rot_dim)[0],
+            _rms_rope(k, None, freqs_cis, k_scale, None, epsilon, split_half, inplace,
+                      rot_dim)[0],
         )
-    return _rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace)
+    return _rms_rope(q, k, freqs_cis, q_scale, k_scale, epsilon, split_half, inplace, rot_dim)
 
 
 def rms_rope1(
@@ -1237,11 +1250,7 @@ def rms_rope_split_half(
     epsilon: float = 1e-6,
     rot_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if rot_dim and rot_dim != q.shape[-1]:
-        # partial rotary is not fused in the WMMA kernel
-        return _eager.rms_rope_split_half(
-            q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
-    return _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, True)
+    return _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, True, rot_dim=rot_dim)
 
 
 def rms_rope_split_half_(
@@ -1255,12 +1264,9 @@ def rms_rope_split_half_(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if k_scale is None:
         k_scale = q_scale
-    if rot_dim and rot_dim != q.shape[-1]:
-        # partial rotary is not fused in the WMMA kernel
-        return _eager.rms_rope_split_half_(
-            q, k, freqs_cis, q_scale, k_scale, epsilon, rot_dim=rot_dim)
     check_rope_inplace(q, k, readonly=(freqs_cis, q_scale, k_scale))
-    return _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, True, inplace=True)
+    return _rms_rope_pair(q, k, freqs_cis, q_scale, k_scale, epsilon, True, inplace=True,
+                          rot_dim=rot_dim)
 
 
 # ---------------------------------------------------------------------------
