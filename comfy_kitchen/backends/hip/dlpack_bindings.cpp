@@ -10,6 +10,8 @@
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/optional.h>
 
+#include "launchers.h"
+
 namespace nb = nanobind;
 
 // Maps a DLPack dtype onto comfy_kitchen.backends.eager.quantization.DTYPE_TO_CODE:
@@ -42,8 +44,6 @@ void launch_stochastic_round_fp8_kernel(void*, const void*, int64_t, int, int, i
 
 void launch_scaled_mm_fp8_kernel(const void*, const void*, void*, const void*, const void*,
                                  const void*, int, int, int, int, int, hipStream_t);
-void launch_int8_gemm_kernel(const void*, const void*, void*, const void*, const void*, int,
-                             const void*, int, int, int, int, int, hipStream_t);
 void launch_convrot_w4a4_gemm_kernel(const void*, const void*, void*, const void*, const void*,
                                      const void*, int, int, int, int, int, hipStream_t);
 
@@ -315,8 +315,8 @@ void int8_gemm(nb::ndarray<> a, nb::ndarray<> b, nb::ndarray<> c, nb::ndarray<> 
     require_bias(bias, N, kFn);
 
     launch_int8_gemm_kernel(a.data(), b.data(), c.data(), scale_a.data(), scale_b.data(),
-                            scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, out_code,
-                            reinterpret_cast<hipStream_t>(stream_ptr));
+                            scale_b_stride, opt_data(bias), opt_code(bias), M, N, K, N /*ldc*/,
+                            out_code, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -525,6 +525,84 @@ void unpack_int4(nb::ndarray<> q, nb::ndarray<> out, int64_t nbytes, uintptr_t s
 
     launch_unpack_int4_kernel(q.data(), out.data(), nbytes,
                               reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// scale_code names the s_rel storage: 0 float32, 5 e4m3 (crossing as uint8, as
+// elsewhere). codebook is optional; without it the levels are uniform.
+void dequant_int4_grouped_to_int8(nb::ndarray<> qdata, nb::ndarray<> s_rel, int scale_code,
+                                  OptArray codebook, nb::ndarray<> out, int N, int K,
+                                  int group_size, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "dequant_int4_grouped_to_int8";
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_positive(group_size, kFn, "group_size");
+    if (scale_code != 0 && scale_code != 5) {
+        throw std::runtime_error(std::string(kFn) + ": s_rel must be float32 or float8_e4m3fn");
+    }
+    if (K % group_size != 0) {
+        throw std::runtime_error(std::string(kFn) + ": group_size must divide K");
+    }
+    require_dtype(qdata, 4, 4, kFn, "qdata");
+    require_dtype(out, 4, 4, kFn, "out");
+    require_dtype(s_rel, scale_code == 0 ? 0 : 3, scale_code == 0 ? 0 : 3, kFn, "s_rel");
+    require_len(qdata, static_cast<int64_t>(N) * (K / 2), kFn, "qdata");
+    require_len(out, static_cast<int64_t>(N) * K, kFn, "out");
+    require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
+    if (codebook.has_value()) {
+        require_scale_len(*codebook, 16, kFn, "codebook");
+    }
+
+    launch_dequant_int4_grouped_to_int8_kernel(
+        qdata.data(), s_rel.data(), scale_code, opt_data(codebook), out.data(), N, K, group_size,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+// Chunked W4A8: decode chunk_cols weight columns at a time and run the INT8 GEMM
+// on each chunk, writing an N-wide slice of out. xq/xs are the already rotated and
+// quantized activation, so the loop only touches the weight.
+void w4a8_int8_gemm_chunked(nb::ndarray<> xq, nb::ndarray<> qdata, nb::ndarray<> s_rel,
+                            int scale_code, OptArray codebook, nb::ndarray<> s_channel,
+                            nb::ndarray<> xs, OptArray bias, nb::ndarray<> workspace,
+                            nb::ndarray<> out, int M, int N, int K, int group_size, int chunk_cols,
+                            int out_code, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "w4a8_int8_gemm_chunked";
+    require_nonneg(M, kFn, "M");
+    require_nonneg(N, kFn, "N");
+    require_nonneg(K, kFn, "K");
+    require_positive(group_size, kFn, "group_size");
+    require_positive(chunk_cols, kFn, "chunk_cols");
+    if (scale_code != 0 && scale_code != 5) {
+        throw std::runtime_error(std::string(kFn) + ": s_rel must be float32 or float8_e4m3fn");
+    }
+    if (K % group_size != 0) {
+        throw std::runtime_error(std::string(kFn) + ": group_size must divide K");
+    }
+    require_dtype(xq, 4, 4, kFn, "xq");
+    require_dtype(qdata, 4, 4, kFn, "qdata");
+    require_dtype(workspace, 4, 4, kFn, "workspace");
+    require_dtype(out, 0, 2, kFn, "out");
+    require_out_matches(out, out_code, kFn);
+    require_dtype(s_rel, scale_code == 0 ? 0 : 3, scale_code == 0 ? 0 : 3, kFn, "s_rel");
+    require_len(xq, static_cast<int64_t>(M) * K, kFn, "xq");
+    require_len(qdata, static_cast<int64_t>(N) * (K / 2), kFn, "qdata");
+    require_len(s_rel, static_cast<int64_t>(N) * (K / group_size), kFn, "s_rel");
+    require_len(out, static_cast<int64_t>(M) * N, kFn, "out");
+    // Every chunk decodes into the same scratch, so it has to hold the widest one.
+    require_len(workspace, static_cast<int64_t>(chunk_cols < N ? chunk_cols : N) * K, kFn,
+                "workspace");
+    require_scale_len(s_channel, static_cast<size_t>(N), kFn, "s_channel");
+    require_scale_len(xs, static_cast<size_t>(M), kFn, "xs");
+    require_bias(bias, N, kFn);
+    if (codebook.has_value()) {
+        require_scale_len(*codebook, 16, kFn, "codebook");
+    }
+
+    launch_w4a8_int8_gemm_chunked_kernel(
+        xq.data(), qdata.data(), s_rel.data(), scale_code, opt_data(codebook), s_channel.data(),
+        xs.data(), opt_data(bias), opt_code(bias), workspace.data(), out.data(), M, N, K,
+        group_size, chunk_cols, out_code, reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
 
@@ -879,6 +957,8 @@ NB_MODULE(_C, m) {
     m.def("convrot_quant_int4", &convrot_quant_int4);
     m.def("convrot_max_k", &convrot_max_k_host);
     m.def("unpack_int4", &unpack_int4);
+    m.def("dequant_int4_grouped_to_int8", &dequant_int4_grouped_to_int8);
+    m.def("w4a8_int8_gemm_chunked", &w4a8_int8_gemm_chunked);
     m.def("adaln", &adaln);
     m.def("rms_adaln", &rms_adaln);
     m.def("apply_rope", &apply_rope);

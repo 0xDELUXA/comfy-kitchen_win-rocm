@@ -37,17 +37,17 @@ static void launch_w4a4(const uint8_t* A, const uint8_t* B, OutT* C, int M, int 
         constexpr int BM = 256, BN = 128, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<MmaInt4, EpiRowwise, OutT, BM, BN, BKB, 4, 2, 4, 4>
-            <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, epi);
+            <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
     } else if (M >= 96 && N >= 96) {
         constexpr int BM = 128, BN = 128, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<MmaInt4, EpiRowwise, OutT, BM, BN, BKB, 4, 2, 2, 4>
-            <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, epi);
+            <<<grid, 256, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
     } else {
         constexpr int BM = 64, BN = 64, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<MmaInt4, EpiRowwise, OutT, BM, BN, BKB, 2, 2, 2, 2>
-            <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, epi);
+            <<<grid, 128, 0, stream>>>(A, B, C, M, N, kbytes, N, epi);
     }
 }
 

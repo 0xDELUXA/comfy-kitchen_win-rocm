@@ -8,6 +8,7 @@
 
 #include "../epilogue.h"
 #include "../gemm_wmma.h"
+#include "../launchers.h"
 
 namespace comfy::hip_backend {
 
@@ -15,7 +16,7 @@ namespace comfy::hip_backend {
 template <typename OutT>
 __global__ __launch_bounds__(256) void gemv_int8_kernel(
     const int8_t* __restrict__ A, const int8_t* __restrict__ B, OutT* __restrict__ C,
-    int M, int N, int K, EpiRowwise epi) {
+    int M, int N, int K, int ldc, EpiRowwise epi) {
 
     const int col = blockIdx.x * blockDim.y + threadIdx.y;
     const int row = blockIdx.y;
@@ -37,13 +38,13 @@ __global__ __launch_bounds__(256) void gemv_int8_kernel(
 
     if (threadIdx.x == 0) {
         epi.init();
-        C[static_cast<int64_t>(row) * N + col] =
+        C[static_cast<int64_t>(row) * ldc + col] =
             static_cast<OutT>(epi(row, col, static_cast<float>(sum)));
     }
 }
 
 template <typename OutT>
-static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N, int K,
+static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N, int K, int ldc,
                         EpiRowwise epi, hipStream_t stream) {
     const uint8_t* Au = reinterpret_cast<const uint8_t*>(A);
     const uint8_t* Bu = reinterpret_cast<const uint8_t*>(B);
@@ -51,24 +52,24 @@ static void launch_int8(const int8_t* A, const int8_t* B, OutT* C, int M, int N,
     if (M <= 8) {
         dim3 block(kWave, 8);
         dim3 grid((N + 7) / 8, M);
-        gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, epi);
+        gemv_int8_kernel<OutT><<<grid, block, 0, stream>>>(A, B, C, M, N, K, ldc, epi);
         return;
     }
     if (M >= 512 && N >= 128 && K > N) {
         constexpr int BM = 256, BN = 128, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<MmaInt8, EpiRowwise, OutT, BM, BN, BKB, 4, 2, 4, 4>
-            <<<grid, 256, 0, stream>>>(Au, Bu, C, M, N, K, epi);
+            <<<grid, 256, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
     } else if (M >= 96 && N >= 96) {
         constexpr int BM = 128, BN = 128, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<MmaInt8, EpiRowwise, OutT, BM, BN, BKB, 4, 2, 2, 4>
-            <<<grid, 256, 0, stream>>>(Au, Bu, C, M, N, K, epi);
+            <<<grid, 256, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
     } else {
         constexpr int BM = 64, BN = 64, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<MmaInt8, EpiRowwise, OutT, BM, BN, BKB, 2, 2, 2, 2>
-            <<<grid, 128, 0, stream>>>(Au, Bu, C, M, N, K, epi);
+            <<<grid, 128, 0, stream>>>(Au, Bu, C, M, N, K, ldc, epi);
     }
 }
 
@@ -79,12 +80,16 @@ extern "C" void launch_int8_gemm_kernel(
     const void* a, const void* b, void* c,
     const void* scale_a, const void* scale_b, int scale_b_stride,
     const void* bias, int bias_code,
-    int M, int N, int K, int out_code, hipStream_t stream) {
+    int M, int N, int K, int ldc, int out_code, hipStream_t stream) {
 
     using namespace comfy::hip_backend;
 
     if (M == 0 || N == 0) {
         return;  // a zero-dimension grid is hipErrorInvalidConfiguration
+    }
+    if (ldc < N) {
+        throw std::runtime_error("int8_gemm: ldc=" + std::to_string(ldc) +
+                                 " is narrower than N=" + std::to_string(N));
     }
     // Both the tile loader and the small-M GEMV read a row 16 bytes at a time; an
     // unaligned K would take the last chunk past the end of the row. An empty GEMM
@@ -101,11 +106,11 @@ extern "C" void launch_int8_gemm_kernel(
     const int8_t* B = static_cast<const int8_t*>(b);
 
     if (out_code == kBF16) {
-        launch_int8<__bf16>(A, B, static_cast<__bf16*>(c), M, N, K, epi, stream);
+        launch_int8<__bf16>(A, B, static_cast<__bf16*>(c), M, N, K, ldc, epi, stream);
     } else if (out_code == kF16) {
-        launch_int8<__half>(A, B, static_cast<__half*>(c), M, N, K, epi, stream);
+        launch_int8<__half>(A, B, static_cast<__half*>(c), M, N, K, ldc, epi, stream);
     } else if (out_code == kF32) {
-        launch_int8<float>(A, B, static_cast<float*>(c), M, N, K, epi, stream);
+        launch_int8<float>(A, B, static_cast<float*>(c), M, N, K, ldc, epi, stream);
     } else {
         throw std::runtime_error("int8_gemm: unsupported output dtype");
     }
