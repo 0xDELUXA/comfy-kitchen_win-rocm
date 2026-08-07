@@ -43,6 +43,9 @@ __all__ = [
     # Normalization
     "adaln",
     "rms_adaln",
+    # Attention
+    "na2d",
+    "na3d",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -105,6 +108,72 @@ __all__ = [
 # =============================================================================
 # Public API Functions
 # =============================================================================
+
+
+def na3d(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kernel_size: int | list[int],
+    is_causal: bool | list[bool] | None = None,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """3D neighborhood attention (NATTEN ``na3d`` semantics, dilation 1).
+
+    Per non-causal axis each query attends a window of exactly
+    ``kernel_size`` positions centered on it, shifted inward at grid
+    boundaries (kernels larger than an axis clamp to that axis); per causal
+    axis it attends the ``min(i + 1, kernel_size)`` nearest previous
+    positions. RoPE/normalization are the caller's responsibility.
+
+    Args:
+        q, k, v: ``(B, T, H, W, num_heads, head_dim)`` tensors, same shape/dtype.
+        kernel_size: Per-axis window sizes ``[k_t, k_h, k_w]``; a bare int
+            repeats across the axes (NATTEN convention).
+        is_causal: Per-axis causal flags; a bare bool repeats across the axes;
+            None means non-causal everywhere.
+        scale: Score scale; None means ``head_dim ** -0.5``. Pass 1.0 for
+            pre-scaled queries.
+
+    Returns:
+        ``(B, T, H, W, num_heads, head_dim)`` attention output.
+    """
+    if isinstance(kernel_size, int):
+        kernel_size = [kernel_size] * 3
+    if is_causal is None:
+        is_causal = [False, False, False]
+    elif isinstance(is_causal, bool):
+        is_causal = [is_causal] * 3
+    return torch.ops.comfy_kitchen.na3d(q, k, v, kernel_size, is_causal, scale)
+
+
+def na2d(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kernel_size: int | list[int],
+    is_causal: bool | list[bool] | None = None,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """2D neighborhood attention over ``(B, H, W, num_heads, head_dim)``
+    tensors; equivalent to ``na3d`` with a singleton, non-causal T axis.
+    Bare-scalar ``kernel_size``/``is_causal`` repeat across both axes."""
+    if isinstance(kernel_size, int):
+        kernel_size = [kernel_size] * 2
+    if is_causal is None:
+        is_causal = [False, False]
+    elif isinstance(is_causal, bool):
+        is_causal = [is_causal] * 2
+    # Checked here: both lists gain a T entry below, hiding a wrong length.
+    if len(kernel_size) != 2:
+        raise ValueError(f"na2d kernel_size must have 2 elements, got {len(kernel_size)}")
+    if len(is_causal) != 2:
+        raise ValueError(f"na2d is_causal must have 2 elements, got {len(is_causal)}")
+    out = torch.ops.comfy_kitchen.na3d(
+        q.unsqueeze(1), k.unsqueeze(1), v.unsqueeze(1),
+        [1, *kernel_size], [False, *is_causal], scale,
+    )
+    return out.squeeze(1)
 
 
 def adaln(

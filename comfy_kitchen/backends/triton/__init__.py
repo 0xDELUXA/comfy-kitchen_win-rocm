@@ -1,5 +1,6 @@
 __all__ = [
     "adaln",
+    "na3d",
     "rms_adaln",
     "apply_rope",
     "apply_rope_",
@@ -35,6 +36,8 @@ from comfy_kitchen.constraints import (
     ExactDims,
     FunctionConstraints,
     ParamConstraint,
+    ValidationResult,
+    na3d_common_call_rule,
 )
 from comfy_kitchen.registry import registry
 
@@ -51,6 +54,7 @@ try:
     )
 
     from .adaln import adaln, rms_adaln
+    from .na import na3d
     from .quantization import (
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
@@ -114,6 +118,15 @@ if _TRITON_AVAILABLE:
 
 
 def _build_constraints() -> dict:
+    def _na3d_call_rule(kwargs):
+        common = na3d_common_call_rule(kwargs)
+        if not common.success:
+            return common
+        q = kwargs.get("q")
+        if q is not None and q.shape[-1] > 128:
+            return ValidationResult.fail("q", "head_dim > 128 not supported by triton na3d")
+        return ValidationResult.ok()
+
     cuda_devices = frozenset({"cuda"})
     triton_devices = frozenset({"cuda", "xpu"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
@@ -313,6 +326,17 @@ def _build_constraints() -> dict:
         "rms_rope_split_half1_": "rms_rope_split_half1",
     }.items():
         out[inplace_name] = out[functional_name]
+    out["na3d"] = FunctionConstraints(
+        params={
+            "q": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
+            "k": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
+            "v": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(6),)),
+        },
+        default_devices=cuda_devices,
+        # tl.dot needs Ampere matrix capability for the non-IEEE float paths
+        min_compute_capability=(8, 0),
+        call_rules=(_na3d_call_rule,),
+    )
     return out
 
 
