@@ -63,6 +63,8 @@ int convrot_max_k_host(int);
 void launch_quantize_w4a8_convrot_kernel(const void*, const void*, void*, void*, void*, int64_t,
                                          int64_t, int, bool, uint64_t, hipStream_t);
 int w4a8_requant_max_k_kernel();
+void launch_na3d_kernel(const void*, const void*, const void*, void*, int, int, int, int, int, int,
+                        int, int, int, int, int, int, float, int, hipStream_t);
 
 void launch_adaln_kernel(const void*, const void*, const void*, void*, int, int, int, int, float,
                          int, int, int, bool, hipStream_t);
@@ -671,6 +673,44 @@ static void adaln_impl(const char* kFn, nb::ndarray<>& x, nb::ndarray<>& scale,
     check_hip_launch();
 }
 
+// Fused 3D neighborhood attention. Every extent is caller-supplied and the kernel
+// indexes up to it, so the operands are sized here rather than trusted.
+void na3d(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> out, int batch,
+          int t_size, int h_size, int w_size, int num_heads, int head_dim, int kt, int kh, int kw,
+          int causal_t, int causal_h, int causal_w, float scale, int dtype_code,
+          uintptr_t stream_ptr) {
+    constexpr const char* kFn = "na3d";
+    require_positive(batch, kFn, "batch");
+    require_positive(t_size, kFn, "t_size");
+    require_positive(h_size, kFn, "h_size");
+    require_positive(w_size, kFn, "w_size");
+    require_positive(num_heads, kFn, "num_heads");
+    require_positive(head_dim, kFn, "head_dim");
+    require_positive(kt, kFn, "kt");
+    require_positive(kh, kFn, "kh");
+    require_positive(kw, kFn, "kw");
+    if (dtype_code != 1 && dtype_code != 2) {
+        throw std::runtime_error(std::string(kFn) + ": q must be float16 or bfloat16");
+    }
+    // The kernel reads k and v off bare pointers with q's extents, so a differing
+    // dtype or a shorter operand is an out-of-bounds device read.
+    const int64_t need = static_cast<int64_t>(batch) * t_size * h_size * w_size * num_heads *
+                         head_dim;
+    require_dtype(q, dtype_code, dtype_code, kFn, "q");
+    require_dtype(k, dtype_code, dtype_code, kFn, "k");
+    require_dtype(v, dtype_code, dtype_code, kFn, "v");
+    require_dtype(out, dtype_code, dtype_code, kFn, "out");
+    require_len(q, need, kFn, "q");
+    require_len(k, need, kFn, "k");
+    require_len(v, need, kFn, "v");
+    require_len(out, need, kFn, "out");
+
+    launch_na3d_kernel(q.data(), k.data(), v.data(), out.data(), batch, t_size, h_size, w_size,
+                       num_heads, head_dim, kt, kh, kw, causal_t, causal_h, causal_w, scale,
+                       dtype_code, reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
 void adaln(nb::ndarray<> x, nb::ndarray<> scale, nb::ndarray<> shift, nb::ndarray<> out, int N,
            int D, int scale_group, int shift_group, float eps, uintptr_t stream_ptr) {
     adaln_impl("adaln", x, scale, shift, out, N, D, scale_group, shift_group, eps,
@@ -992,6 +1032,7 @@ NB_MODULE(_C, m) {
     m.def("quantize_w4a8_convrot", &quantize_w4a8_convrot);
     m.def("w4a8_requant_max_k", &w4a8_requant_max_k_kernel);
     m.def("w4a8_int8_gemm_chunked", &w4a8_int8_gemm_chunked);
+    m.def("na3d", &na3d);
     m.def("adaln", &adaln);
     m.def("rms_adaln", &rms_adaln);
     m.def("apply_rope", &apply_rope);

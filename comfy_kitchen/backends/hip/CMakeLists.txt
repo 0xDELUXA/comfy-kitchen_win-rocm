@@ -159,6 +159,7 @@ set(HIP_SOURCES
     ops/gemm_int8.hip
     ops/convrot_w4a4.hip
     ops/adaln.hip
+    ops/na3d.hip
     ops/apply_rope.hip
     ops/rms_rope.hip
     ops/gemv_awq.hip

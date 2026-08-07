@@ -16,6 +16,7 @@ from comfy_kitchen.backends.eager.quantization import (
 from comfy_kitchen.backends.eager.quantization import (
     rotate_int8_convrot_weight as eager_rotate_int8_convrot_weight,
 )
+from comfy_kitchen.constraints import validate_function_call
 from comfy_kitchen.registry import registry
 from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor
 from comfy_kitchen.tensor.int8_utils import _build_hadamard
@@ -2141,3 +2142,160 @@ def test_convrot_launcher_rejects_unsupported_group_size(hip, group_size):
         hip._C.convrot_quant_int4(
             hip._dl(x), hip._dl(q), hip._dl(scales), 8, 128, group_size, hip._stream(x)
         )
+
+
+# ---------------------------------------------------------------------------
+# Neighborhood attention
+# ---------------------------------------------------------------------------
+
+
+def _na_window(i, kernel, length, causal):
+    if causal:
+        return max(0, i - kernel + 1), i + 1
+    kernel = min(kernel, length)
+    s = min(max(i - kernel // 2, 0), length - kernel)
+    return s, s + kernel
+
+
+def _ref_na3d(q, k, v, kernel_size, is_causal, scale):
+    """Per-query loop over the NATTEN window, accumulated and returned in fp32.
+
+    Upstream's copy of this reference rounds each window result back to the input
+    dtype. Keeping it in fp32 costs nothing and stops a fifth of the bf16 tolerance
+    budget going on a rounding the reference never had to do.
+    """
+    b, t, h, w, nh, hd = q.shape
+    if scale is None:
+        scale = hd ** -0.5
+    out = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+    for ti in range(t):
+        t0, t1 = _na_window(ti, kernel_size[0], t, is_causal[0])
+        for hi in range(h):
+            h0, h1 = _na_window(hi, kernel_size[1], h, is_causal[1])
+            for wi in range(w):
+                w0, w1 = _na_window(wi, kernel_size[2], w, is_causal[2])
+                kk = k[:, t0:t1, h0:h1, w0:w1].reshape(b, -1, nh, hd)
+                vv = v[:, t0:t1, h0:h1, w0:w1].reshape(b, -1, nh, hd)
+                s = torch.einsum("bnd,bknd->bnk", q[:, ti, hi, wi].float(), kk.float()) * scale
+                a = torch.softmax(s, dim=-1)
+                out[:, ti, hi, wi] = torch.einsum("bnk,bknd->bnd", a, vv.float())
+    return out
+
+
+NA_CASES = [
+    ((1, 5, 9, 12, 2, 64), (3, 7, 7), (False, False, False)),
+    ((1, 12, 13, 15, 2, 64), (11, 11, 11), (False, False, False)),
+    ((2, 6, 8, 8, 4, 64), (5, 5, 5), (True, False, False)),
+    ((1, 3, 6, 6, 2, 64), (5, 5, 5), (True, False, False)),    # kernel > dims, causal T
+    ((1, 2, 5, 5, 2, 64), (3, 7, 7), (False, False, False)),   # kernel > dims -> clamp
+    ((1, 1, 16, 16, 2, 64), (1, 5, 5), (False, False, False)),  # single frame (na2d shape)
+    ((1, 4, 7, 40, 2, 32), (3, 5, 5), (False, False, False)),
+    ((1, 2, 3, 65, 2, 64), (3, 3, 5), (False, False, False)),  # ragged tail query block
+    ((1, 2, 3, 96, 1, 64), (1, 3, 33), (False, False, False)),  # window wider than a key tile
+    ((1, 3, 4, 34, 2, 16), (3, 3, 5), (False, False, False)),
+    ((1, 3, 4, 34, 2, 48), (3, 3, 5), (False, False, False)),  # head_dim not a power of 2
+    ((1, 4, 6, 20, 2, 64), (3, 5, 7), (False, False, True)),   # causal W
+    ((1, 4, 6, 20, 2, 64), (3, 5, 7), (False, True, False)),   # causal H
+    ((1, 4, 6, 20, 2, 64), (3, 5, 7), (True, True, True)),
+    ((2, 3, 4, 18, 3, 32), (3, 3, 5), (False, False, False)),  # batch and heads > 1
+]
+
+
+@pytest.mark.parametrize(("shape", "kernel", "causal"), NA_CASES)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("scale", [None, 1.0])
+@needs_wmma
+def test_na3d_matches_the_windowed_reference(hip, shape, kernel, causal, dtype, scale):
+    torch.manual_seed(0)
+    q = torch.randn(shape, device=DEV, dtype=dtype)
+    k = torch.randn(shape, device=DEV, dtype=dtype)
+    v = torch.randn(shape, device=DEV, dtype=dtype)
+
+    out = hip.na3d(q, k, v, list(kernel), list(causal), scale)
+    ref = _ref_na3d(q, k, v, kernel, causal, scale)
+
+    assert out.shape == q.shape
+    torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+
+
+@needs_wmma
+def test_na3d_reads_a_non_contiguous_input(hip):
+    """The kernel indexes off bare pointers with contiguous strides, so a permuted
+    view has to be materialised rather than read at its own strides."""
+    torch.manual_seed(0)
+    shape = (1, 4, 6, 20, 2, 64)
+    kernel, causal = (3, 5, 5), (False, False, False)
+    # A head slice, so the head stride no longer packs. All three operands get one:
+    # the kernel reads each off a bare pointer, so a copy dropped from any of them
+    # would leave that one read at packed strides.
+    views = [
+        torch.randn(1, 4, 6, 20, 4, 64, device=DEV, dtype=torch.bfloat16)[:, :, :, :, :2]
+        for _ in range(3)
+    ]
+    assert all(x.shape == shape and not x.is_contiguous() for x in views)
+
+    torch.testing.assert_close(
+        hip.na3d(*views, list(kernel), list(causal), None).float(),
+        hip.na3d(*(x.contiguous() for x in views), list(kernel), list(causal), None).float(),
+        rtol=0,
+        atol=0,
+    )
+
+
+@needs_wmma
+def test_na3d_dispatches_to_hip(hip):
+    """fp32 has no 16-bit matrix path and must not reach the kernel; the half types
+    must, or the op silently needs triton at runtime."""
+    constraints = hip._build_constraints(has_wmma=True)["na3d"]
+    shape = (1, 4, 6, 20, 2, 64)
+    for dtype, expected in ((torch.bfloat16, True), (torch.float16, True), (torch.float32, False)):
+        x = torch.zeros(shape, device=DEV, dtype=dtype)
+        kwargs = {"q": x, "k": x, "v": x, "kernel_size": [3, 5, 5], "is_causal": None}
+        assert validate_function_call(constraints, kwargs).success is expected
+
+    # head_dim is bounded by the WMMA K-step and the register-resident accumulators.
+    for head_dim, expected in ((16, True), (48, True), (64, True), (80, False), (24, False)):
+        x = torch.zeros(1, 2, 3, 8, 2, head_dim, device=DEV, dtype=torch.bfloat16)
+        kwargs = {"q": x, "k": x, "v": x, "kernel_size": [1, 3, 3], "is_causal": None}
+        assert validate_function_call(constraints, kwargs).success is expected
+
+    # Both grid dims at their boundary, off a stride-0 view so the rejected shape
+    # costs no memory. The reason is read back as well, or a shape some other rule
+    # happens to decline would pass this for the wrong branch.
+    base = torch.zeros(1, 1, 1, 1, 1, 64, device=DEV, dtype=torch.bfloat16)
+    for fits, over in (
+        ((1, 65535, 1, 1, 1, 64), (1, 65536, 1, 1, 1, 64)),  # blocks over T*H
+        ((65535, 1, 1, 1, 1, 64), (65536, 1, 1, 1, 1, 64)),  # blocks over B*heads
+    ):
+        def call(shape):
+            x = base.expand(shape)
+            return validate_function_call(
+                constraints,
+                {"q": x, "k": x, "v": x, "kernel_size": [1, 1, 1], "is_causal": None},
+            )
+
+        assert call(fits).success
+        assert call(over).failure_reason == "grid dims exceed HIP limits"
+
+
+@needs_wmma
+def test_na3d_launcher_rejects_a_mismatched_operand(hip):
+    """_C is importable, so the size checks cannot be left to the Python layer: the
+    kernel reads k and v with q's extents."""
+    q = torch.zeros(1, 2, 3, 16, 2, 64, device=DEV, dtype=torch.bfloat16)
+    short = torch.zeros(1, 2, 3, 8, 2, 64, device=DEV, dtype=torch.bfloat16)
+    out = torch.empty_like(q)
+    # Codes come from the shared table the wrapper dispatches on, so a change there
+    # cannot leave this test asserting against a stale literal.
+    extents = (1, 2, 3, 16, 2, 64, 1, 3, 3, 0, 0, 0, 0.125)
+    stream = 0
+
+    # Both operands are read with q's extents, so both slots are checked: a launcher
+    # that validates one and forgets the other reads past the end of the other.
+    for k_arg, v_arg in ((short, q), (q, short)):
+        with pytest.raises(RuntimeError, match="needs at least"):
+            hip._C.na3d(hip._dl(q), hip._dl(k_arg), hip._dl(v_arg), hip._dl(out),
+                        *extents, hip.DTYPE_TO_CODE[torch.bfloat16], stream)
+    with pytest.raises(RuntimeError, match="float16 or bfloat16"):
+        hip._C.na3d(hip._dl(q.float()), hip._dl(q), hip._dl(q), hip._dl(out),
+                    *extents, hip.DTYPE_TO_CODE[torch.float32], stream)

@@ -153,6 +153,8 @@ def test_hip_drops_gemms_without_matrix_cores():
     # would pass while any single one was missing from the constraints.
     assert set(with_wmma) >= hip_backend._WMMA_ONLY_OPS
     assert not (hip_backend._WMMA_ONLY_OPS & set(without))
+    # na3d is a matrix-core kernel: without one it traps rather than answers.
+    assert "na3d" in hip_backend._WMMA_ONLY_OPS
     # The elementwise kernels need no matrix cores and must survive.
     for op in ("apply_rope", "apply_rope_", "rms_rope", "rms_rope_split_half1_", "adaln",
                "rms_adaln", "quantize_per_tensor_fp8", "gemv_awq_w4a16",

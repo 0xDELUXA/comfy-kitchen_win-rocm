@@ -44,6 +44,7 @@ logger = logging.getLogger("comfy_kitchen.hip")
 
 __all__ = [
     "adaln",
+    "na3d",
     "rms_adaln",
     "gemv_awq_w4a16",
     "quantize_svdquant_w4a4",
@@ -161,6 +162,7 @@ _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
 # which gates on has_wmma() itself rather than through the registry.
 _WMMA_ONLY_OPS = frozenset({
     "int8_linear",
+    "na3d",
     "convrot_w4a4_linear",
     "scaled_mm_svdquant_w4a4",
     "w4a8_int8_linear",
@@ -1299,6 +1301,54 @@ def scaled_mm_svdquant_w4a4(
 # Normalization and positional encoding
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Neighborhood attention
+# ---------------------------------------------------------------------------
+
+
+def na3d(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kernel_size: Sequence[int],
+    is_causal: Sequence[bool] | None = None,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Fused 3D neighborhood attention (NATTEN ``na3d`` semantics) over
+    ``(B, T, H, W, NH, HD)`` tensors, on WMMA. See ops/na3d.hip."""
+    causal = (False, False, False) if is_causal is None else tuple(is_causal)
+    batch, t, h, w, num_heads, head_dim = q.shape
+    if scale is None:
+        scale = head_dim ** -0.5
+
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+    out = torch.empty_like(q)
+    _C.na3d(
+        _dl(q),
+        _dl(k),
+        _dl(v),
+        _dl(out),
+        batch,
+        t,
+        h,
+        w,
+        num_heads,
+        head_dim,
+        int(kernel_size[0]),
+        int(kernel_size[1]),
+        int(kernel_size[2]),
+        int(causal[0]),
+        int(causal[1]),
+        int(causal[2]),
+        float(scale),
+        DTYPE_TO_CODE[q.dtype],
+        _stream(q),
+    )
+    return out
+
+
 def _adaln_impl(kernel, x, scale, shift, eps) -> torch.Tensor:
     """``kernel`` is _C.adaln (LayerNorm) or _C.rms_adaln (RMSNorm)."""
     from comfy_kitchen.backends._modulation import adaln_prep_modulation
@@ -1636,15 +1686,43 @@ def _build_constraints(has_wmma: bool = True) -> dict:
         ExactDims,
         FunctionConstraints,
         ParamConstraint,
+        ValidationResult,
+        na3d_common_call_rule,
     )
 
     # PyTorch exposes ROCm tensors with device type "cuda".
     dev = frozenset({"cuda", "hip"})
     floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
+    half_floats = frozenset({torch.float16, torch.bfloat16})
     fp8s = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
     out_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
 
+    def _na3d_call_rule(kwargs):
+        common = na3d_common_call_rule(kwargs)
+        if not common.success:
+            return common
+        q = kwargs.get("q")
+        if q is not None:
+            head_dim = q.shape[-1]
+            # The WMMA K-step is 16 wide and the output accumulators are held in
+            # registers, one 16-column tile each.
+            if head_dim % 16 != 0 or head_dim > 64:
+                return ValidationResult.fail("q", "head_dim must be a multiple of 16 and <= 64")
+            if q.shape[1] * q.shape[2] > 65535 or q.shape[0] * q.shape[4] > 65535:
+                return ValidationResult.fail("q", "grid dims exceed HIP limits")
+        return ValidationResult.ok()
+
     constraints = {
+        # fp32 has no 16-bit matrix path, so it goes to triton/eager.
+        "na3d": FunctionConstraints(
+            params={
+                "q": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(6),)),
+                "k": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(6),)),
+                "v": ParamConstraint(dtypes=half_floats, shape_rules=(ExactDims(6),)),
+            },
+            default_devices=dev,
+            call_rules=(_na3d_call_rule,),
+        ),
         "quantize_per_tensor_fp8": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=floats),

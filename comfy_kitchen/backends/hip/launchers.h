@@ -13,6 +13,13 @@
 
 extern "C" {
 
+// Fused 3D neighborhood attention over contiguous (B, T, H, W, NH, HD) tensors.
+// dtype_code is a DTYPE_TO_CODE value: 1 float16, 2 bfloat16. See ops/na3d.hip.
+void launch_na3d_kernel(const void* q, const void* k, const void* v, void* out, int batch,
+                        int t_size, int h_size, int w_size, int num_heads, int head_dim, int kt,
+                        int kh, int kw, int causal_t, int causal_h, int causal_w, float scale,
+                        int dtype_code, hipStream_t stream);
+
 // ldc is c's row stride, so a caller writing an N-column slice of a wider output
 // passes that output's width; a whole GEMM passes N.
 void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* scale_a,
