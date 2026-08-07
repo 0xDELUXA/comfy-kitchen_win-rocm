@@ -173,6 +173,8 @@ from comfy_kitchen.backends.eager.svdquant import (  # noqa: E402
     _unpack_int4_row_major,
 )
 from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
+    _QUANT_ROW_ELEM_BUDGET,
+    _decide_codebook,
     _dequantize_w4a8_int8_weight_from_int8,
     _quantize_w4a8_chunked,
     validate_w4a8_operands,
@@ -1351,6 +1353,60 @@ def rotate_int8_convrot_weight(weight: torch.Tensor, group_size: int) -> torch.T
     return output
 
 
+_W4A8_FUSED_QUANT = hasattr(_C, "quantize_w4a8_convrot")
+# Fused kernel holds K/16 fp32 group scales in shared memory; cap at ~48 KB so the launch
+# fits (K over ~190k -- far above any real layer -- falls back to eager).
+_W4A8_FUSED_MAX_K = 16 * (47 * 1024 // 4)
+
+
+def _fused_quantize_w4a8_kernel(
+    rotated: torch.Tensor,
+    codebook_f32: torch.Tensor,
+    packed: torch.Tensor,
+    s_rel: torch.Tensor,
+    s_channel: torch.Tensor,
+    stochastic_rounding: int,
+) -> None:
+    """Run the fused kernel on ``rotated``, writing into the given (possibly row-sliced) outputs."""
+    stream_ptr = torch.cuda.current_stream(rotated.device).cuda_stream
+    _C.quantize_w4a8_convrot(
+        _wrap_for_dlpack(rotated.contiguous()),
+        _wrap_for_dlpack(codebook_f32),
+        _wrap_for_dlpack(packed),
+        _wrap_for_dlpack(s_rel.view(torch.uint8)),
+        _wrap_for_dlpack(s_channel),
+        stochastic_rounding > 0,
+        int(stochastic_rounding),
+        stream_ptr,
+    )
+
+
+def _fused_quantize_w4a8(
+    weight: torch.Tensor,
+    codebook: torch.Tensor,
+    convrot_groupsize: int,
+    stochastic_rounding: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, torch.Tensor]:
+    """Rotate + fused requant (group_size 16, fp8 s_rel), row-chunked so peak memory stays
+    capped -- no full rotated copy. The kernel is per-row and s_rel/s_channel/packed are all
+    per-row, so row blocks write straight into their output slices (no cross-row reduction)."""
+    n, k = weight.shape
+    groups = k // 16
+    cb = codebook.to(device=weight.device, dtype=torch.float32).contiguous()
+    packed = torch.empty(n, k // 2, dtype=torch.int8, device=weight.device)
+    s_rel = torch.empty(n, groups, dtype=torch.float8_e4m3fn, device=weight.device)
+    s_channel = torch.empty(n, dtype=torch.float32, device=weight.device)
+    block = max(1, _QUANT_ROW_ELEM_BUDGET // max(k, 1))
+    for r0 in range(0, n, block):
+        r1 = min(r0 + block, n)
+        rot = rotate_int8_convrot_weight(weight[r0:r1].contiguous(), convrot_groupsize)
+        # offset the SR seed per block so chunks decorrelate yet stay deterministic
+        seed = stochastic_rounding + r0 if stochastic_rounding > 0 else 0
+        _fused_quantize_w4a8_kernel(rot, cb, packed[r0:r1], s_rel[r0:r1], s_channel[r0:r1], seed)
+        del rot
+    return packed, s_rel, s_channel, None, cb
+
+
 def quantize_w4a8_int8_weight(
     weight: torch.Tensor,
     group_size: int = 16,
@@ -1359,6 +1415,7 @@ def quantize_w4a8_int8_weight(
     scale_dtype: torch.dtype = torch.float8_e4m3fn,
     codebook: bool = True,
     codebook_tensor: torch.Tensor | None = None,
+    stochastic_rounding: int = 0,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -1368,6 +1425,22 @@ def quantize_w4a8_int8_weight(
 ]:
     """Prepare W4A8 weights using native CUDA ConvRot and eager packing math."""
     validate_w4a8_weight_shape(weight, group_size, convrot_groupsize)
+    # Fused CUDA requant for the default codebook layout (group_size 16, fp8 scales);
+    # asym / uniform / fp32-scale / other group sizes use the chunked eager path.
+    if (
+        _W4A8_FUSED_QUANT
+        and symmetric
+        and codebook
+        and group_size == 16
+        and scale_dtype == torch.float8_e4m3fn
+        and weight.shape[1] <= _W4A8_FUSED_MAX_K
+    ):
+        cb = (
+            codebook_tensor
+            if codebook_tensor is not None
+            else _decide_codebook(weight, rotate_int8_convrot_weight, group_size, convrot_groupsize)
+        )
+        return _fused_quantize_w4a8(weight, cb, convrot_groupsize, stochastic_rounding)
     return _quantize_w4a8_chunked(
         weight,
         rotate_int8_convrot_weight,
@@ -1377,6 +1450,7 @@ def quantize_w4a8_int8_weight(
         scale_dtype=scale_dtype,
         codebook=codebook,
         codebook_override=codebook_tensor,
+        stochastic_rounding=stochastic_rounding,
     )
 
 
