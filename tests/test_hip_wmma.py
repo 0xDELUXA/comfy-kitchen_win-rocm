@@ -8,11 +8,13 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
+from comfy_kitchen.backends.eager import w4a8_int8 as eager_w4a8
 from comfy_kitchen.backends.eager.convrot_w4a4 import _unpack_int4_row_major
 from comfy_kitchen.backends.eager.quantization import (
     quantize_and_rotate_rowwise as eager_quantize_and_rotate_rowwise,
 )
 from comfy_kitchen.registry import registry
+from comfy_kitchen.tensor import AsymW4A8Int8Layout, QuantizedTensor
 from comfy_kitchen.tensor.int8_utils import _build_hadamard
 
 
@@ -447,6 +449,225 @@ def test_convrot_w4a4_roundtrip(hip):
     assert deq.shape == w.shape
     rel = (deq - w.float()).norm() / w.float().norm()
     assert rel < 0.2  # int4 weight fidelity
+
+
+# ---------------------------------------------------------------------------
+# Grouped W4A8 over the INT8 GEMM
+# ---------------------------------------------------------------------------
+
+def _quantize_w4a8(n, k, **kwargs):
+    w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16) * 0.02
+    return w, eager_w4a8.quantize_w4a8_int8_weight(w, **kwargs)
+
+
+@pytest.mark.parametrize("group_size", [4, 8, 16, 32, 64])
+@pytest.mark.parametrize("scale_dtype", [torch.float8_e4m3fn, torch.float32])
+@pytest.mark.parametrize("codebook", [False, True])
+def test_w4a8_int4_decode_is_bit_exact(hip, group_size, scale_dtype, codebook):
+    """The decode rounds one value at a time, so it must agree with eager exactly."""
+    torch.manual_seed(0)
+    _, (qdata, s_rel, _, _, cb) = _quantize_w4a8(
+        128, 512, group_size=group_size, scale_dtype=scale_dtype, codebook=codebook
+    )
+
+    out = hip._dequant_int4_grouped_to_int8(qdata, s_rel, cb, group_size)
+    ref = eager_w4a8._dequant_int4_grouped_to_int8(qdata, s_rel, cb, group_size)
+
+    assert out.shape == ref.shape and out.dtype == torch.int8
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("symmetric", [True, False])
+def test_w4a8_dequantize_weight_matches_eager(hip, symmetric):
+    torch.manual_seed(0)
+    w, (qdata, s_rel, s_channel, correction, cb) = _quantize_w4a8(
+        128, 512, symmetric=symmetric, codebook=symmetric
+    )
+    kwargs = {"codebook": cb, "correction": correction, "output_dtype": torch.bfloat16}
+
+    out = hip.dequantize_w4a8_int8_weight(qdata, s_rel, s_channel, **kwargs)
+    ref = eager_w4a8.dequantize_w4a8_int8_weight(qdata, s_rel, s_channel, **kwargs)
+
+    torch.testing.assert_close(out.float(), ref.float(), rtol=0, atol=0)
+    rel = (out.float() - w.float()).norm() / w.float().norm()
+    assert rel < 0.2  # int4 weight fidelity
+
+
+@pytest.mark.parametrize(("m", "n", "k"), [(1, 256, 512), (17, 512, 256), (256, 1024, 512)])
+@pytest.mark.parametrize("bias", [False, True])
+@needs_wmma
+def test_w4a8_linear_matches_eager(hip, m, n, k, bias):
+    torch.manual_seed(0)
+    _, (qdata, s_rel, s_channel, correction, cb) = _quantize_w4a8(n, k)
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    bias_t = torch.randn(n, device=DEV, dtype=torch.bfloat16) if bias else None
+    kwargs = {
+        "codebook": cb,
+        "correction": correction,
+        "bias": bias_t,
+        "out_dtype": torch.bfloat16,
+    }
+
+    out = hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, **kwargs)
+    ref = eager_w4a8.w4a8_int8_linear(x, qdata, s_rel, s_channel, **kwargs)
+
+    assert out.shape == (m, n)
+    # Both decode the weight identically and differ only in how the activation
+    # quantizer rounds, so compare with an int8-sized tolerance.
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
+
+
+@pytest.mark.parametrize(("n", "chunk_cols"), [(1024, 256), (1280, 512), (1152, 384)])
+@pytest.mark.parametrize("m", [4, 192], ids=["gemv", "wmma"])
+@needs_wmma
+def test_w4a8_linear_chunking_does_not_change_the_result(hip, monkeypatch, n, chunk_cols, m):
+    """Each chunk writes an N-column slice of the output through ldc, so a chunk
+    boundary (including a short trailing one) must not disturb its neighbours."""
+    torch.manual_seed(0)
+    k = 512
+    _, (qdata, s_rel, s_channel, _, cb) = _quantize_w4a8(n, k)
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    bias = torch.randn(n, device=DEV, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(hip, "_w4a8_chunk_cols", lambda *_: n)
+    one_pass = hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, codebook=cb, bias=bias)
+    monkeypatch.setattr(hip, "_w4a8_chunk_cols", lambda *_: chunk_cols)
+    chunked = hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, codebook=cb, bias=bias)
+
+    assert chunked.shape == (m, n)
+    assert torch.equal(chunked, one_pass)
+
+
+def test_w4a8_chunk_cols_stays_within_its_bounds(hip):
+    n, k, dev = 12288, 3072, torch.device(DEV, torch.cuda.current_device())
+    cols = hip._w4a8_chunk_cols(1, n, k, dev)
+    assert cols < n
+    assert cols % 128 == 0
+    assert hip._W4A8_MIN_CHUNK_COLS <= cols <= hip._W4A8_MAX_CHUNK_COLS
+    # Enough rows that the GEMM, not the decode, sets the cost.
+    assert hip._w4a8_chunk_cols(hip._W4A8_CHUNK_MAX_ROWS + 1, n, k, dev) == n
+    # A weight no wider than one chunk is decoded in one pass either way.
+    assert hip._w4a8_chunk_cols(1, cols // 2, k, dev) == cols // 2
+    # A deep K keeps the floor rather than shrinking the GEMM's N grid, and a
+    # shallow one keeps the cap rather than widening a chunk pointlessly.
+    assert hip._w4a8_chunk_cols(1, n, 1 << 20, dev) == hip._W4A8_MIN_CHUNK_COLS
+    assert hip._w4a8_chunk_cols(1, 1 << 20, 16, dev) == hip._W4A8_MAX_CHUNK_COLS
+
+
+@pytest.mark.parametrize("m", [4, 192], ids=["gemv", "wmma"])
+@needs_wmma
+def test_w4a8_realigns_an_offset_qdata(hip, m):
+    """The decode reads packed weights as uint2, so qdata has to start aligned;
+    contiguous() is a no-op on a slice that does not."""
+    torch.manual_seed(0)
+    n, k = 256, 512
+    _, (qdata, s_rel, s_channel, _, cb) = _quantize_w4a8(n, k)
+    offset = _offset_copy(qdata)
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+
+    assert torch.equal(
+        hip._dequant_int4_grouped_to_int8(offset, s_rel, cb, 16),
+        hip._dequant_int4_grouped_to_int8(qdata, s_rel, cb, 16),
+    )
+    assert torch.equal(
+        hip.w4a8_int8_linear(x, offset, s_rel, s_channel, codebook=cb),
+        hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, codebook=cb),
+    )
+
+
+@needs_wmma
+def test_w4a8_consumes_a_row_chunked_quantize(hip):
+    """The shared packer rotates and packs in row chunks and pins one codebook across
+    them. HIP owns no part of that, so what it must keep proving is that it decodes
+    whatever comes out, including a table reused across a requantize."""
+    torch.manual_seed(0)
+    k = 2048
+    n = eager_w4a8._QUANT_ROW_ELEM_BUDGET // k + 512  # over the packer's row budget
+    w = torch.randn(n, k, device=DEV, dtype=torch.bfloat16) * 0.02
+    qdata, s_rel, _, _, cb = eager_w4a8.quantize_w4a8_int8_weight(w)
+    assert cb is not None
+
+    assert torch.equal(
+        hip._dequant_int4_grouped_to_int8(qdata, s_rel, cb, 16),
+        eager_w4a8._dequant_int4_grouped_to_int8(qdata, s_rel, cb, 16),
+    )
+
+    # A LoRA-style reload pins the earlier table instead of choosing a new one.
+    updated = w + torch.randn_like(w) * 0.002
+    packed = eager_w4a8.quantize_w4a8_int8_weight(updated, codebook_tensor=cb)
+    x = torch.randn(64, k, device=DEV, dtype=torch.bfloat16)
+    out = hip.w4a8_int8_linear(x, packed[0], packed[1], packed[2], codebook=packed[4])
+    ref = eager_w4a8.w4a8_int8_linear(x, packed[0], packed[1], packed[2], codebook=packed[4])
+
+    scale = ref.float().abs().max().item()
+    assert (out.float() - ref.float()).abs().max().item() < 0.05 * scale
+
+
+@needs_wmma
+def test_w4a8_linear_asymmetric_matches_eager(hip):
+    """The zero-point correction has no INT8 epilogue; that layout runs off the
+    dequantized weight, which the eager path does too."""
+    torch.manual_seed(0)
+    _, (qdata, s_rel, s_channel, correction, cb) = _quantize_w4a8(
+        128, 512, symmetric=False, codebook=False
+    )
+    assert correction is not None
+    x = torch.randn(64, 512, device=DEV, dtype=torch.bfloat16)
+    kwargs = {"codebook": cb, "correction": correction, "out_dtype": torch.bfloat16}
+
+    out = hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, **kwargs)
+    ref = eager_w4a8.w4a8_int8_linear(x, qdata, s_rel, s_channel, **kwargs)
+
+    torch.testing.assert_close(out.float(), ref.float(), rtol=0, atol=0)
+
+
+@needs_wmma
+def test_w4a8_linear_dispatches_to_hip():
+    torch.manual_seed(0)
+    w = torch.randn(256, 512, device=DEV, dtype=torch.bfloat16) * 0.02
+    qdata, params = AsymW4A8Int8Layout.quantize(w)
+    x = torch.randn(32, 512, device=DEV, dtype=torch.bfloat16)
+
+    impl = registry.get_implementation(
+        "w4a8_int8_linear",
+        kwargs={
+            "x": x,
+            "qdata": qdata,
+            "s_rel": params.scale,
+            "s_channel": params.s_channel,
+            "codebook": params.codebook,
+            "correction": params.correction,
+            "bias": None,
+            "group_size": params.group_size,
+            "convrot_groupsize": params.convrot_groupsize,
+            "out_dtype": torch.bfloat16,
+        },
+    )
+    assert impl.__module__ == "comfy_kitchen.backends.hip"
+
+    out = torch.nn.functional.linear(x, QuantizedTensor(qdata, "AsymW4A8Int8Layout", params))
+    rel = (out.float() - (x @ w.t()).float()).norm() / (x @ w.t()).float().norm()
+    assert out.shape == (32, 256)
+    assert rel < 0.2
+
+
+# 0 and 3 are caught by the positivity and divisibility checks. 2 and 12 divide
+# their K and only the vector layout rejects them: 2 is under the four scales a
+# vector loads, 12 neither divides 16 nor is a multiple of it.
+@pytest.mark.parametrize(("group_size", "k"), [(0, 256), (3, 256), (2, 256), (12, 48)])
+def test_w4a8_decode_launcher_rejects_an_unsupported_group_size(hip, group_size, k):
+    """Each vector loads four group scales, so the wrappers only reach the kernel
+    with a group of 4, 8, 16 or a multiple of 16; guard the C++ callers too."""
+    qdata = torch.zeros(8, k // 2, dtype=torch.int8, device=DEV)
+    s_rel = torch.ones(8, k // max(group_size, 1), dtype=torch.float32, device=DEV)
+    out = torch.zeros(8, k, dtype=torch.int8, device=DEV)
+
+    with pytest.raises(RuntimeError, match="group_size"):
+        hip._C.dequant_int4_grouped_to_int8(
+            hip._dl(qdata), hip._dl(s_rel), 0, None, hip._dl(out), 8, k, group_size,
+            hip._stream(qdata),
+        )
 
 
 def test_quantize_int8_rowwise_matches_eager():

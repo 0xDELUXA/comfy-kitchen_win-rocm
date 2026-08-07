@@ -5,7 +5,9 @@
 // gfx12.
 //
 // Computes C[M, N] = epilogue(A[M, K] @ B[N, K]^T). The B operand is the weight
-// in its natural (N, K) row-major form, matching torch linear.
+// in its natural (N, K) row-major form, matching torch linear. C is written with
+// row stride ldc, so a caller splitting N into column chunks can point at a slice
+// of a wider output; ldc == N for a whole GEMM.
 //
 // The tile loop is byte-addressed: LDS holds raw rows, and how many bytes of a
 // row one MMA consumes (Mma::kStepBytes) and how a lane reads its fragment out of
@@ -78,7 +80,7 @@ template <typename Mma, typename Epi, typename OutT,
           int BM, int BN, int BKB, int WARPS_M, int WARPS_N, int TM, int TN>
 __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
     const uint8_t* __restrict__ A, const uint8_t* __restrict__ B, OutT* __restrict__ C,
-    int M, int N, int kbytes, Epi epi) {
+    int M, int N, int kbytes, int ldc, Epi epi) {
 
     constexpr int kThreads = WARPS_M * WARPS_N * kWave;
     constexpr int kStride = BKB + kLdsPad;
@@ -205,7 +207,7 @@ __global__ __launch_bounds__(WARPS_M* WARPS_N* kWave) void gemm_wmma_kernel(
         for (int e = 0; e < 8; ++e) {
             const int r = m0 + wm * (TM * 16) + i * 16 + acc_row(lane, e);
             if (r >= M) continue;
-            OutT* crow = C + static_cast<int64_t>(r) * N;
+            OutT* crow = C + static_cast<int64_t>(r) * ldc;
             #pragma unroll
             for (int j = 0; j < TN; ++j) {
                 const int col = n0 + wn * (TN * 16) + j * 16 + col_lane;

@@ -64,17 +64,17 @@ static void launch_fp8(const uint8_t* A, const uint8_t* B, OutT* C, int M, int N
         constexpr int BM = 256, BN = 128, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<MmaFp8, EpiTensorwise, OutT, BM, BN, BKB, 4, 2, 4, 4>
-            <<<grid, 256, 0, stream>>>(A, B, C, M, N, K, epi);
+            <<<grid, 256, 0, stream>>>(A, B, C, M, N, K, N, epi);
     } else if (M >= 96 && N >= 96) {
         constexpr int BM = 128, BN = 128, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<MmaFp8, EpiTensorwise, OutT, BM, BN, BKB, 4, 2, 2, 4>
-            <<<grid, 256, 0, stream>>>(A, B, C, M, N, K, epi);
+            <<<grid, 256, 0, stream>>>(A, B, C, M, N, K, N, epi);
     } else {
         constexpr int BM = 64, BN = 64, BKB = 64;
         dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
         gemm_wmma_kernel<MmaFp8, EpiTensorwise, OutT, BM, BN, BKB, 2, 2, 2, 2>
-            <<<grid, 128, 0, stream>>>(A, B, C, M, N, K, epi);
+            <<<grid, 128, 0, stream>>>(A, B, C, M, N, K, N, epi);
     }
 }
 
