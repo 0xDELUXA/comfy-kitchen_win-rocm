@@ -159,6 +159,9 @@ def test_hip_drops_gemms_without_matrix_cores():
                "dequantize_int8_simple_dtype",
                "dequantize_int8_convrot_weight_dtype"):
         assert op in without
+    # The fused W4A8 requantize is elementwise too: it packs weights and never
+    # reaches a matrix core, so RDNA2 must keep it.
+    assert "quantize_w4a8_int8_weight" in without
 
 
 def test_hip_advertises_every_inplace_rope_entry():
