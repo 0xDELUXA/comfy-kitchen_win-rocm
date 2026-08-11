@@ -372,9 +372,8 @@ def int8_attention_from_prequantized(
         raise ValueError("prequantized INT8 attention tensors must be on a CUDA device")
     if any(tensor.device != quantized.q.device for tensor in packed_tensors[1:]):
         raise ValueError("prequantized INT8 attention tensors must be on the same CUDA device")
-    if quantized.attn_mask is not None:
-        if quantized.attn_mask.device != quantized.q.device:
-            raise ValueError("attn_mask must be on the same CUDA device as the packed tensors")
+    if quantized.attn_mask is not None and quantized.attn_mask.device != quantized.q.device:
+        raise ValueError("attn_mask must be on the same CUDA device as the packed tensors")
     if not is_available(quantized.q.device):
         raise RuntimeError(
             "INT8 attention requires the comfy-kitchen CUDA extension on SM75 or newer"
