@@ -85,17 +85,13 @@ extern "C" void launch_sage_attn_kernel(
     int stride_bz_q, int stride_seq_q, int stride_h_q, int stride_bz_k,
     int stride_seq_k, int stride_h_k, int stride_bz_v, int stride_h_v,
     int stride_d_v, int stride_bz_o, int stride_seq_o, int stride_h_o,
-    int is_causal, float sm_scale, int output_dtype_code, cudaStream_t stream) {
+    float sm_scale, int output_dtype_code, cudaStream_t stream) {
   if (cta_k != 64 && cta_k != 128) {
     throw std::runtime_error("sage_attn: cta_k must be 64 or 128");
   }
-  if (mask != nullptr && is_causal) {
+  if (cta_k == 128 && (head_dim == 64 || mask != nullptr)) {
     throw std::runtime_error(
-        "sage_attn: attention mask and causal mode cannot be combined");
-  }
-  if (cta_k == 128 && (head_dim == 64 || mask != nullptr || is_causal)) {
-    throw std::runtime_error(
-        "sage_attn: cta_k 128 requires unmasked, non-causal head_dim 128 or 256");
+        "sage_attn: cta_k 128 requires unmasked head_dim 128 or 256");
   }
   int num_kv_groups = num_qo_heads / num_kv_heads;
 
@@ -131,8 +127,8 @@ extern "C" void launch_sage_attn_kernel(
 #define DISPATCH_DTYPE(HD, MM)                                                 \
   if (output_dtype_code == 1) {                                                \
     if constexpr (MM == MaskMode::kNone) {                                    \
-      if (kv_len <= 512) {                                                     \
-        LAUNCH_CTA(HD, MM, half, false);                                       \
+      if (kv_len <= 512 && cta_k == 64) {                                      \
+        LAUNCH(HD, 64, MM, half, false);                                       \
       } else {                                                                 \
         LAUNCH_CTA(HD, MM, half, true);                                        \
       }                                                                        \
@@ -141,8 +137,8 @@ extern "C" void launch_sage_attn_kernel(
     }                                                                          \
   } else {                                                                     \
     if constexpr (MM == MaskMode::kNone) {                                    \
-      if (kv_len <= 512) {                                                     \
-        LAUNCH_CTA(HD, MM, nv_bfloat16, false);                                \
+      if (kv_len <= 512 && cta_k == 64) {                                      \
+        LAUNCH(HD, 64, MM, nv_bfloat16, false);                                \
       } else {                                                                 \
         LAUNCH_CTA(HD, MM, nv_bfloat16, true);                                 \
       }                                                                        \
@@ -151,25 +147,23 @@ extern "C" void launch_sage_attn_kernel(
     }                                                                          \
   }
 
-#define DISPATCH_CAUSAL(HD)                                                    \
+#define DISPATCH_MASK(HD)                                                      \
   if (mask != nullptr) {                                                       \
     if (mask_stride_q == 0) {                                                  \
       DISPATCH_DTYPE(HD, MaskMode::kCustomKey);                                \
     } else {                                                                   \
       DISPATCH_DTYPE(HD, MaskMode::kCustom);                                   \
     }                                                                          \
-  } else if (is_causal) {                                                      \
-    DISPATCH_DTYPE(HD, MaskMode::kCausal);                                     \
   } else {                                                                     \
     DISPATCH_DTYPE(HD, MaskMode::kNone);                                       \
   }
 
   if (head_dim == 64) {
-    DISPATCH_CAUSAL(64);
+    DISPATCH_MASK(64);
   } else if (head_dim == 128) {
-    DISPATCH_CAUSAL(128);
+    DISPATCH_MASK(128);
   } else if (head_dim == 256) {
-    DISPATCH_CAUSAL(256);
+    DISPATCH_MASK(256);
   } else {
     throw std::runtime_error("sage_attn: unsupported head_dim " +
                              std::to_string(head_dim));
@@ -178,5 +172,5 @@ extern "C" void launch_sage_attn_kernel(
 #undef LAUNCH
 #undef LAUNCH_CTA
 #undef DISPATCH_DTYPE
-#undef DISPATCH_CAUSAL
+#undef DISPATCH_MASK
 }

@@ -15,12 +15,6 @@
 // compiler can constant-fold address arithmetic (divisions, modulos) and
 // eliminate dead scalar-fallback code when C is a multiple of 4.
 //
-// Smooth-K: when enabled, a custom k_mean_reduce kernel computes per-channel
-// means across the sequence dimension using vectorized loads and shared-memory
-// reduction, then quant_k_kernel subtracts them inline during quantization.
-// Both kernels run back-to-back on the same stream so K data stays warm in L2
-// cache between the two reads.
-
 #include "dtype_dispatch.cuh"
 #include "float_utils.cuh"
 
@@ -289,18 +283,16 @@ process_q(const T *__restrict__ in, int8_t *__restrict__ out,
 // ---------------------------------------------------------------------------
 // K processing device function
 //
-// When AUTO_CENTER_K is enabled and anchor_index is nonnegative, subtracts
-// that key vector from every key. Otherwise, when km != nullptr (float32),
-// subtracts the per-channel mean. Both shifts are exactly softmax-invariant
-// and happen before abs-max reduction, rotation, and quantization.
+// When anchor_index is nonnegative, subtracts that key vector from every key.
+// The shift is exactly softmax-invariant and happens before abs-max reduction,
+// rotation, and quantization.
 // ---------------------------------------------------------------------------
 template <typename T, int NL, int WARPK, int CHANNEL_TILES, int ROTATION,
-          bool AUTO_CENTER_K, bool ALIGNED4>
+          bool ALIGNED4>
 __forceinline__ __device__ void
 process_k(const T *__restrict__ in, int8_t *__restrict__ out,
           float *__restrict__ sc_buf, const int oblk, const int L, const int C,
-          const float *__restrict__ km, const int anchor_index,
-          const int64_t stride_n) {
+          const int anchor_index, const int64_t stride_n) {
   const int lane = threadIdx.x & 31;
   const int wid = threadIdx.x >> 5;
   const int otld = wid;
@@ -310,40 +302,21 @@ process_k(const T *__restrict__ in, int8_t *__restrict__ out,
   for (int i = 0; i < CHANNEL_TILES * 4; ++i)
     bias[i] = 0.f;
 
-  if constexpr (AUTO_CENTER_K) {
-    if (anchor_index >= 0) {
-#pragma unroll
-      for (int tile = 0; tile < CHANNEL_TILES; ++tile) {
-        const int ch = tile * 128 + (lane << 2);
-        const int64_t anchor_offset =
-            (int64_t)anchor_index * stride_n + ch;
-        if (ALIGNED4 || ch + 3 < C) {
-          VectorLoader4<T>::load(&in[anchor_offset], &bias[tile * 4]);
-        } else if (ch < C) {
-#pragma unroll
-          for (int c = 0; c < 4; ++c)
-            bias[tile * 4 + c] =
-                (ch + c < C)
-                    ? static_cast<float>(__ldg(&in[anchor_offset + c]))
-                    : 0.f;
-        }
-      }
-    }
-  } else if (km) {
+  if (anchor_index >= 0) {
 #pragma unroll
     for (int tile = 0; tile < CHANNEL_TILES; ++tile) {
       const int ch = tile * 128 + (lane << 2);
+      const int64_t anchor_offset =
+          (int64_t)anchor_index * stride_n + ch;
       if (ALIGNED4 || ch + 3 < C) {
-        float4 b4 = __ldg(reinterpret_cast<const float4 *>(&km[ch]));
-        bias[tile * 4] = b4.x;
-        bias[tile * 4 + 1] = b4.y;
-        bias[tile * 4 + 2] = b4.z;
-        bias[tile * 4 + 3] = b4.w;
+        VectorLoader4<T>::load(&in[anchor_offset], &bias[tile * 4]);
       } else if (ch < C) {
 #pragma unroll
         for (int c = 0; c < 4; ++c)
           bias[tile * 4 + c] =
-              (ch + c < C) ? __ldg(&km[ch + c]) : 0.f;
+              (ch + c < C)
+                  ? static_cast<float>(__ldg(&in[anchor_offset + c]))
+                  : 0.f;
       }
     }
   }
@@ -469,103 +442,6 @@ process_k(const T *__restrict__ in, int8_t *__restrict__ out,
   }
 }
 #pragma nv_diag_default 1056
-
-// ---------------------------------------------------------------------------
-// K channel-mean reduction kernel (smooth-k)
-//
-// Computes km[b,h,d] = (1/Lk) * sum_n k[b,h,n,d]   ∀ (b,h,d).
-//
-// Grid: (num_tile_blks, H_kv, B)   — multiple blocks per (b,h) head.
-// Block: MEAN_BLK_DIM threads.
-//
-// Each thread covers 4 channels (via float2 vectorized loads of 4 bf16).
-// D=128 → 32 "channel groups".  With MEAN_BLK_DIM threads we have
-// MEAN_BLK_DIM/32 "row workers" per channel group.  Each row worker
-// loops over a subset of N rows (strided), accumulating 4 fp32 partial
-// sums.  A shared-memory reduction then sums across all row workers that
-// share the same channel group, producing one partial per channel group
-// per block.  The partial is atomicAdd'd to the output.  The last block
-// for each (b,h) divides by Lk to get the mean.
-//
-// km_out: [B * H_kv * C]  float32  (pre-zeroed by the caller)
-// done:   [B * H_kv]      int32    (pre-zeroed by the caller)
-// ---------------------------------------------------------------------------
-constexpr int MEAN_BLK_DIM = 256;
-constexpr int MEAN_ROWS_PER_BLK = 512;
-
-template <typename T, int CHANNEL_GROUPS>
-__global__ __launch_bounds__(MEAN_BLK_DIM) void k_mean_reduce(
-    const T *__restrict__ k_in, float *__restrict__ km_out,
-    int *__restrict__ done, const int Lk, const int C, const int H_kv,
-    const int n_blks, const float inv_Lk, const int64_t stride_b,
-    const int64_t stride_h, const int64_t stride_n) {
-  const int tile = blockIdx.x;
-  const int h = blockIdx.y, b = blockIdx.z;
-  const int64_t bh_off = (int64_t)b * stride_b + (int64_t)h * stride_h;
-  const int bh_idx = b * H_kv + h;
-
-  constexpr int ROW_WORKERS = MEAN_BLK_DIM / CHANNEL_GROUPS;
-  const int cg = threadIdx.x % CHANNEL_GROUPS;
-  const int rw = threadIdx.x / CHANNEL_GROUPS;
-  const int ch = cg << 2;                        // starting channel
-
-  const int row_base = tile * MEAN_ROWS_PER_BLK;
-
-  float4 acc = {0.f, 0.f, 0.f, 0.f};
-
-  if (ch < C) {
-    for (int r = rw; r < MEAN_ROWS_PER_BLK; r += ROW_WORKERS) {
-      const int n = row_base + r;
-      if (n < Lk) {
-        float vals[4];
-        VectorLoader4<T>::load(&k_in[bh_off + (int64_t)n * stride_n + ch], vals);
-        acc.x += vals[0];
-        acc.y += vals[1];
-        acc.z += vals[2];
-        acc.w += vals[3];
-      }
-    }
-  }
-
-  // Reduce across all 8 row-workers that share the same channel group.
-  // Row workers for the same channel group are in different warps, so we
-  // use shared memory: each worker writes its float4 partial, then
-  // worker 0 sums all 8 partials for its channel group.
-  __shared__ float4 smem[ROW_WORKERS][CHANNEL_GROUPS];
-  smem[rw][cg] = acc;
-  __syncthreads();
-
-  // First row worker (rw==0) sums all 8 partials for its channel group.
-  if (rw == 0 && ch < C) {
-    float4 s = smem[0][cg];
-#pragma unroll
-    for (int i = 1; i < ROW_WORKERS; ++i) {
-      float4 v = smem[i][cg];
-      s.x += v.x;
-      s.y += v.y;
-      s.z += v.z;
-      s.w += v.w;
-    }
-
-    atomicAdd(&km_out[bh_idx * C + ch], s.x);
-    atomicAdd(&km_out[bh_idx * C + ch + 1], s.y);
-    atomicAdd(&km_out[bh_idx * C + ch + 2], s.z);
-    atomicAdd(&km_out[bh_idx * C + ch + 3], s.w);
-  }
-  __syncthreads();
-
-  __shared__ bool is_last_block;
-  if (threadIdx.x == 0) {
-    __threadfence();
-    int prev = atomicAdd(&done[bh_idx], 1);
-    is_last_block = prev == n_blks - 1;
-  }
-  __syncthreads();
-  if (is_last_block) {
-    for (int c = threadIdx.x; c < C; c += blockDim.x)
-      km_out[bh_idx * C + c] *= inv_Lk;
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Model-independent K stabilization detector
@@ -748,15 +624,14 @@ __global__ __launch_bounds__(128, 4) void quant_q_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Standalone K kernel  (km may be nullptr when smooth-k is disabled)
-// km is float32 [B, H_kv, C] computed by k_mean_reduce.
+// Standalone K kernel
 // ---------------------------------------------------------------------------
 template <typename T, int NL, int WARPK, int CHANNEL_TILES, int ROTATION,
-          bool AUTO_CENTER_K, bool ALIGNED4>
+          bool ALIGNED4>
 __global__ __launch_bounds__(128, 4) void quant_k_kernel(
     const T *__restrict__ k_in, int8_t *__restrict__ k_out,
-    float *__restrict__ k_sb, const float *__restrict__ km,
-    const int *__restrict__ anchor_indices, const int Lk, const int C,
+    float *__restrict__ k_sb, const int *__restrict__ anchor_indices,
+    const int Lk, const int C,
     const int H_kv, const int k_sc_per_h, const int64_t stride_b,
     const int64_t stride_h, const int64_t stride_n) {
   const int oblk = blockIdx.x;
@@ -764,13 +639,10 @@ __global__ __launch_bounds__(128, 4) void quant_k_kernel(
   const int64_t in_bh = (int64_t)b * stride_b + (int64_t)h * stride_h;
   const int64_t out_bh = ((int64_t)b * H_kv + h) * Lk * C;
   const int64_t sbh = ((int64_t)b * H_kv + h) * k_sc_per_h;
-  const float *km_bh = km ? km + ((int64_t)b * H_kv + h) * C : nullptr;
-  int anchor_index = -1;
-  if constexpr (AUTO_CENTER_K)
-    anchor_index = __ldg(&anchor_indices[b * H_kv + h]);
-  process_k<T, NL, WARPK, CHANNEL_TILES, ROTATION, AUTO_CENTER_K,
-            ALIGNED4>(k_in + in_bh, k_out + out_bh, k_sb + sbh, oblk, Lk,
-                      C, km_bh, anchor_index, stride_n);
+  const int anchor_index = __ldg(&anchor_indices[b * H_kv + h]);
+  process_k<T, NL, WARPK, CHANNEL_TILES, ROTATION, ALIGNED4>(
+      k_in + in_bh, k_out + out_bh, k_sb + sbh, oblk, Lk, C, anchor_index,
+      stride_n);
 }
 
 // ---------------------------------------------------------------------------
@@ -779,12 +651,12 @@ __global__ __launch_bounds__(128, 4) void quant_k_kernel(
 // blockIdx.x >= q_oblk_count →  K path
 // ---------------------------------------------------------------------------
 template <typename T, int NR, int NL, int BLKQ, int WARPQ, int BLKK, int WARPK,
-          int CHANNEL_TILES, int ROTATION, bool AUTO_CENTER_K, bool ALIGNED4>
+          int CHANNEL_TILES, int ROTATION, bool ALIGNED4>
 __global__ __launch_bounds__(128, 3) void quant_qk_fused(
     const T *__restrict__ q_in, int8_t *__restrict__ q_out,
     float *__restrict__ q_sb, const T *__restrict__ k_in,
     int8_t *__restrict__ k_out, float *__restrict__ k_sb,
-    const float *__restrict__ km, const int *__restrict__ anchor_indices,
+    const int *__restrict__ anchor_indices,
     const int Lq, const int Lk, const int C, const int q_oblk_count,
     const int H_q, const int H_kv, const int q_sc_per_h, const int k_sc_per_h,
     const int64_t q_stride_b, const int64_t q_stride_h,
@@ -807,42 +679,36 @@ __global__ __launch_bounds__(128, 3) void quant_qk_fused(
     const int64_t in_bh = (int64_t)b * k_stride_b + (int64_t)h * k_stride_h;
     const int64_t out_bh = ((int64_t)b * H_kv + h) * Lk * C;
     const int64_t sbh = ((int64_t)b * H_kv + h) * k_sc_per_h;
-    const float *km_bh = km ? km + ((int64_t)b * H_kv + h) * C : nullptr;
-    int anchor_index = -1;
-    if constexpr (AUTO_CENTER_K)
-      anchor_index = __ldg(&anchor_indices[b * H_kv + h]);
-    process_k<T, NL, WARPK, CHANNEL_TILES, ROTATION, AUTO_CENTER_K,
-              ALIGNED4>(k_in + in_bh, k_out + out_bh, k_sb + sbh,
-                        (int)blockIdx.x - q_oblk_count, Lk, C, km_bh,
-                        anchor_index, k_stride_n);
+    const int anchor_index = __ldg(&anchor_indices[b * H_kv + h]);
+    process_k<T, NL, WARPK, CHANNEL_TILES, ROTATION, ALIGNED4>(
+        k_in + in_bh, k_out + out_bh, k_sb + sbh,
+        (int)blockIdx.x - q_oblk_count, Lk, C, anchor_index, k_stride_n);
   }
 }
 
 } // namespace
 
-// smooth_k == 1 → compute km into km_scratch, pass to quant_k_kernel.
-// km_scratch: [B * H_kv * C] float32  (will be zeroed internally).
-// km_done:    [B * H_kv]     int32    (will be zeroed internally).
 extern "C" void launch_quant_qk_per_thread_int8(
     const void *q, void *q_int8, void *q_scale, const void *k, void *k_int8,
-    void *k_scale, int smooth_k, void *km_scratch, void *km_done, int B,
-    int H_q, int Lq, int H_kv, int Lk, int C, int BLKQ, int WARPQ, int BLKK,
-    int WARPK, int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
-    int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
-    int input_dtype_code, int convrot, int stabilize_k, void *anchor_indices,
+    void *k_scale, int B, int H_q, int Lq, int H_kv, int Lk, int C, int BLKQ,
+    int WARPQ, int BLKK, int WARPK, int64_t q_stride_b, int64_t q_stride_h,
+    int64_t q_stride_n, int64_t k_stride_b, int64_t k_stride_h,
+    int64_t k_stride_n, int input_dtype_code, void *anchor_indices,
     cudaStream_t stream) {
-  if (C <= 0 || C > CENTER_MAX_CHANNELS) {
+  if (C != 64 && C != 128 && C != 256) {
     throw std::runtime_error(
-        "quant_qk_per_thread_int8: head_dim must be in [1, 256]");
+        "quant_qk_per_thread_int8: padded head_dim must be 64, 128, or 256");
   }
-  if (C % 4 != 0) {
-    throw std::runtime_error(
-        "quant_qk_per_thread_int8: head_dim must be a multiple of 4");
-  }
-  if (BLKQ != 128 || (WARPQ != 16 && WARPQ != 32) ||
-      (BLKK != 64 && BLKK != 128) || WARPK != BLKK) {
+  const int expected_warpq = C == 256 ? 16 : 32;
+  if (BLKQ != 128 || WARPQ != expected_warpq ||
+      (BLKK != 64 && BLKK != 128) || WARPK != BLKK ||
+      (C == 64 && BLKK != 64)) {
     throw std::runtime_error(
         "quant_qk_per_thread_int8: unsupported block/warp configuration");
+  }
+  if (!anchor_indices) {
+    throw std::runtime_error(
+        "quant_qk_per_thread_int8: anchor_indices scratch is required");
   }
   const size_t element_size = input_dtype_code == 0 ? sizeof(float) : sizeof(half);
   const size_t vector_size = 4 * element_size;
@@ -863,66 +729,20 @@ extern "C" void launch_quant_qk_per_thread_int8(
   const int k_oblk = (Lk + BLKK - 1) / BLKK * (BLKK / WARPK);
   const int q_sc_per_h = q_oblk * 8;
   const int k_sc_per_h = k_oblk * 4;
-  // ALIGNED4 means every warp lane's 4-channel group is fully in-bounds,
-  // so we can skip per-lane ch<C checks and always use vectorized loads.
-  // 32 lanes × 4 channels = 128, so C must be ≥128 AND 4-aligned.
-  const bool aligned4 = C == 128 || C == 256;
-
-  float *km_ptr = nullptr;
-  if (smooth_k && km_scratch && km_done) {
-    const int mean_blks = (Lk + MEAN_ROWS_PER_BLK - 1) / MEAN_ROWS_PER_BLK;
-    const float inv_Lk = 1.f / static_cast<float>(Lk);
-
-    const size_t km_bytes = (size_t)B * H_kv * C * sizeof(float);
-    const size_t done_bytes = (size_t)B * H_kv * sizeof(int);
-    cudaError_t error = cudaMemsetAsync(km_scratch, 0, km_bytes, stream);
-    if (error != cudaSuccess) {
-      throw std::runtime_error(std::string("quant_qk km_scratch memset failed: ") +
-                               cudaGetErrorString(error));
-    }
-    error = cudaMemsetAsync(km_done, 0, done_bytes, stream);
-    if (error != cudaSuccess) {
-      throw std::runtime_error(std::string("quant_qk km_done memset failed: ") +
-                               cudaGetErrorString(error));
-    }
-
-    dim3 gm(mean_blks, H_kv, B);
-    DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
-      if (C > 128) {
-        k_mean_reduce<T, 64><<<gm, MEAN_BLK_DIM, 0, stream>>>(
-            (const T *)k, (float *)km_scratch, (int *)km_done, Lk, C, H_kv,
-            mean_blks, inv_Lk, k_stride_b, k_stride_h, k_stride_n);
-      } else {
-        k_mean_reduce<T, 32><<<gm, MEAN_BLK_DIM, 0, stream>>>(
-            (const T *)k, (float *)km_scratch, (int *)km_done, Lk, C, H_kv,
-            mean_blks, inv_Lk, k_stride_b, k_stride_h, k_stride_n);
-      }
-    });
-    cudaError_t launch_error = cudaGetLastError();
-    if (launch_error != cudaSuccess) {
-      throw std::runtime_error(std::string("k_mean_reduce kernel launch failed: ") +
-                               cudaGetErrorString(launch_error));
-    }
-    km_ptr = (float *)km_scratch;
+  auto *anchor_ptr = static_cast<int *>(anchor_indices);
+  dim3 gd(H_kv, B);
+  DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
+    detect_k_anchor<T><<<gd, CENTER_DETECT_THREADS, 0, stream>>>(
+        (const T *)k, anchor_ptr, Lk, C, H_kv, k_stride_b, k_stride_h,
+        k_stride_n);
+  });
+  cudaError_t anchor_error = cudaGetLastError();
+  if (anchor_error != cudaSuccess) {
+    throw std::runtime_error(std::string("detect_k_anchor kernel launch failed: ") +
+                             cudaGetErrorString(anchor_error));
   }
 
-  int *anchor_ptr = nullptr;
-  if (stabilize_k && !smooth_k && anchor_indices) {
-    dim3 gd(H_kv, B);
-    DISPATCH_FP_DTYPE(input_dtype_code, T, [&] {
-      detect_k_anchor<T><<<gd, CENTER_DETECT_THREADS, 0, stream>>>(
-          (const T *)k, (int *)anchor_indices, Lk, C, H_kv, k_stride_b,
-          k_stride_h, k_stride_n);
-    });
-    cudaError_t error = cudaGetLastError();
-    if (error != cudaSuccess) {
-      throw std::runtime_error(std::string("detect_k_anchor kernel launch failed: ") +
-                               cudaGetErrorString(error));
-    }
-    anchor_ptr = (int *)anchor_indices;
-  }
-
-#define LAUNCH_SPLIT(T, NR, NL, BQ, WQ, BK, WK, CT, ROT, AUTO, A4)             \
+#define LAUNCH_SPLIT(T, NR, NL, BQ, WQ, BK, WK, CT, ROT, A4)                   \
   do {                                                                         \
     dim3 gq(q_oblk, H_q, B);                                                   \
     quant_q_kernel<T, NR, BQ, WQ, CT, ROT, A4>                                 \
@@ -934,24 +754,24 @@ extern "C" void launch_quant_qk_per_thread_int8(
       throw std::runtime_error(std::string("quant_q kernel launch failed: ") + \
                                cudaGetErrorString(q_error));                    \
     dim3 gk(k_oblk, H_kv, B);                                                  \
-    quant_k_kernel<T, NL, WK, CT, ROT, AUTO, A4>                               \
+    quant_k_kernel<T, NL, WK, CT, ROT, A4>                                     \
         <<<gk, 128, 0, stream>>>(                                              \
-        (const T *)k, (int8_t *)k_int8, (float *)k_scale, km_ptr, anchor_ptr,  \
-        Lk, C, H_kv, k_sc_per_h, k_stride_b, k_stride_h, k_stride_n);          \
+        (const T *)k, (int8_t *)k_int8, (float *)k_scale, anchor_ptr, Lk, C,   \
+        H_kv, k_sc_per_h, k_stride_b, k_stride_h, k_stride_n);                 \
     cudaError_t k_error = cudaGetLastError();                                   \
     if (k_error != cudaSuccess)                                                 \
       throw std::runtime_error(std::string("quant_k kernel launch failed: ") + \
                                cudaGetErrorString(k_error));                    \
   } while (0)
 
-#define LAUNCH_FUSED(T, NR, NL, BQ, WQ, BK, WK, CT, ROT, AUTO, A4)             \
+#define LAUNCH_FUSED(T, NR, NL, BQ, WQ, BK, WK, CT, ROT, A4)                   \
   do {                                                                         \
     const int H_max = H_q > H_kv ? H_q : H_kv;                                 \
     dim3 g(q_oblk + k_oblk, H_max, B);                                         \
-    quant_qk_fused<T, NR, NL, BQ, WQ, BK, WK, CT, ROT, AUTO, A4>               \
+    quant_qk_fused<T, NR, NL, BQ, WQ, BK, WK, CT, ROT, A4>                     \
         <<<g, 128, 0, stream>>>(                                                \
         (const T *)q, (int8_t *)q_int8, (float *)q_scale, (const T *)k,        \
-        (int8_t *)k_int8, (float *)k_scale, km_ptr, anchor_ptr, Lq, Lk, C,     \
+        (int8_t *)k_int8, (float *)k_scale, anchor_ptr, Lq, Lk, C,             \
         q_oblk, H_q, H_kv, q_sc_per_h, k_sc_per_h, q_stride_b, q_stride_h,     \
         q_stride_n, k_stride_b, k_stride_h, k_stride_n);                       \
     cudaError_t qk_error = cudaGetLastError();                                  \
@@ -961,46 +781,66 @@ extern "C" void launch_quant_qk_per_thread_int8(
           cudaGetErrorString(qk_error));                                        \
   } while (0)
 
-#define LAUNCH_SELECTED(T, ROT, AUTO)                                          \
+#define LAUNCH_C64(T, ROT)                                                      \
+  LAUNCH_FUSED(T, 4, 8, 128, 32, 64, 64, 1, ROT, false)
+
+#define LAUNCH_C128_CTA64(T, ROT)                                              \
+  LAUNCH_FUSED(T, 4, 8, 128, 32, 64, 64, 1, ROT, true)
+
+#define LAUNCH_C128_CTA128(T, ROT)                                             \
+  LAUNCH_FUSED(T, 4, 16, 128, 32, 128, 128, 1, ROT, true)
+
+#define LAUNCH_C256_CTA64(T, ROT)                                              \
+  LAUNCH_SPLIT(T, 2, 8, 128, 16, 64, 64, 2, ROT, true)
+
+#define LAUNCH_C256_CTA128(T, ROT)                                             \
+  LAUNCH_SPLIT(T, 2, 16, 128, 16, 128, 128, 2, ROT, true)
+
+// Dispatch head dimension and CTA shape before rotation. The previous
+// LAUNCH_SELECTED macro put runtime shape checks inside every rotation/dtype
+// branch, which made NVCC instantiate all eight tile configurations at every
+// call site even though only these five configurations can reach the kernel.
+#define DISPATCH_C64(T, LAUNCHER)                                              \
   do {                                                                         \
-    if (BLKQ == 128 && WARPQ == 16 && BLKK == 128 && WARPK == 128) {           \
-      LAUNCH_SPLIT(T, 2, 16, 128, 16, 128, 128, 2, ROT, AUTO, true);           \
-    } else if (BLKQ == 128 && WARPQ == 16 && BLKK == 64 && WARPK == 64) {      \
-      LAUNCH_SPLIT(T, 2, 8, 128, 16, 64, 64, 2, ROT, AUTO, true);              \
-    } else if (BLKK == 128 && WARPK == 128 && C == 256) {                      \
-      LAUNCH_SPLIT(T, 4, 16, 128, 32, 128, 128, 2, ROT, AUTO, true);           \
-    } else if (C == 256) {                                                     \
-      LAUNCH_SPLIT(T, 4, 8, 128, 32, 64, 64, 2, ROT, AUTO, true);              \
-    } else if (BLKK == 128 && WARPK == 128 && aligned4) {                      \
-      LAUNCH_FUSED(T, 4, 16, 128, 32, 128, 128, 1, ROT, AUTO, true);           \
-    } else if (BLKK == 128 && WARPK == 128) {                                  \
-      LAUNCH_FUSED(T, 4, 16, 128, 32, 128, 128, 1, ROT, AUTO, false);          \
-    } else if (aligned4) {                                                     \
-      LAUNCH_FUSED(T, 4, 8, 128, 32, 64, 64, 1, ROT, AUTO, true);              \
+    if (Lk <= 256) {                                                           \
+      LAUNCHER(T, 4);                                                          \
     } else {                                                                   \
-      LAUNCH_FUSED(T, 4, 8, 128, 32, 64, 64, 1, ROT, AUTO, false);             \
+      LAUNCHER(T, 64);                                                         \
     }                                                                          \
   } while (0)
 
-#define DO_AUTO(T, AUTO)                                                       \
-  if (!convrot) {                                                              \
-    LAUNCH_SELECTED(T, 0, AUTO);                                               \
-  } else if (Lk <= 256) {                                                      \
-    LAUNCH_SELECTED(T, 4, AUTO);                                               \
-  } else if (C == 128 && !smooth_k) {                                          \
-    LAUNCH_SELECTED(T, 128, AUTO);                                             \
-  } else if (C >= 128) {                                                       \
-    LAUNCH_SELECTED(T, 129, AUTO);                                             \
-  } else {                                                                     \
-    LAUNCH_SELECTED(T, 64, AUTO);                                              \
-  }
+#define DISPATCH_C128(T, LAUNCHER)                                             \
+  do {                                                                         \
+    if (Lk <= 256) {                                                           \
+      LAUNCHER(T, 4);                                                          \
+    } else {                                                                   \
+      LAUNCHER(T, 128);                                                        \
+    }                                                                          \
+  } while (0)
+
+#define DISPATCH_C256(T, LAUNCHER)                                             \
+  do {                                                                         \
+    if (Lk <= 256) {                                                           \
+      LAUNCHER(T, 4);                                                          \
+    } else {                                                                   \
+      LAUNCHER(T, 129);                                                        \
+    }                                                                          \
+  } while (0)
 
 #define DO(T)                                                                  \
   do {                                                                         \
-    if (anchor_ptr) {                                                          \
-      DO_AUTO(T, true);                                                        \
+    if (C == 64) {                                                             \
+      DISPATCH_C64(T, LAUNCH_C64);                                             \
+    } else if (C == 128) {                                                     \
+      if (BLKK == 128) {                                                       \
+        DISPATCH_C128(T, LAUNCH_C128_CTA128);                                  \
+      } else {                                                                 \
+        DISPATCH_C128(T, LAUNCH_C128_CTA64);                                   \
+      }                                                                        \
+    } else if (BLKK == 128) {                                                  \
+      DISPATCH_C256(T, LAUNCH_C256_CTA128);                                    \
     } else {                                                                   \
-      DO_AUTO(T, false);                                                       \
+      DISPATCH_C256(T, LAUNCH_C256_CTA64);                                     \
     }                                                                          \
   } while (0)
 
@@ -1008,7 +848,13 @@ extern "C" void launch_quant_qk_per_thread_int8(
 
 #undef LAUNCH_SPLIT
 #undef LAUNCH_FUSED
-#undef LAUNCH_SELECTED
-#undef DO_AUTO
+#undef LAUNCH_C64
+#undef LAUNCH_C128_CTA64
+#undef LAUNCH_C128_CTA128
+#undef LAUNCH_C256_CTA64
+#undef LAUNCH_C256_CTA128
+#undef DISPATCH_C64
+#undef DISPATCH_C128
+#undef DISPATCH_C256
 #undef DO
 }

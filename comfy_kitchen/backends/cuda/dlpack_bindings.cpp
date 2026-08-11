@@ -175,13 +175,11 @@ extern "C" {
     void launch_quant_qk_per_thread_int8(
         const void* q, void* q_int8, void* q_scale,
         const void* k, void* k_int8, void* k_scale,
-        int smooth_k, void* km_scratch, void* km_done,
         int B, int H_q, int Lq, int H_kv, int Lk, int C,
         int BLKQ, int WARPQ, int BLKK, int WARPK,
         int64_t q_stride_b, int64_t q_stride_h, int64_t q_stride_n,
         int64_t k_stride_b, int64_t k_stride_h, int64_t k_stride_n,
-        int input_dtype_code, int convrot, int stabilize_k,
-        void* anchor_indices, cudaStream_t stream);
+        int input_dtype_code, void* anchor_indices, cudaStream_t stream);
 
     void launch_quant_v_int8_kernel(
         const void* v, void* out, void* scale,
@@ -199,8 +197,7 @@ extern "C" {
         int k_st_bz, int k_st_n, int k_st_h,
         int v_st_bz, int v_st_h, int v_st_d,
         int o_st_bz, int o_st_n, int o_st_h,
-        int is_causal, float sm_scale, int output_dtype_code,
-        cudaStream_t stream);
+        float sm_scale, int output_dtype_code, cudaStream_t stream);
 
     // SVDQuant W4A4 — see ops/quantize_svdquant_w4a4.cu
     void launch_svdquant_quantize_w4a4_kernel(
@@ -863,10 +860,7 @@ void quant_v_int8(
         input_dtype_code, stream);
 }
 
-// Nanobind wrapper: INT8 Q/K per-thread quant (contiguous HND layout)
-// smooth_k: 1 = fuse K-mean computation + subtraction into the kernel.
-// km_scratch_ptr / km_done_ptr: device pointers for scratch buffers
-// (pre-zeroed by the caller).  Ignored when smooth_k == 0.
+// Nanobind wrapper: stabilized INT8 Q/K per-thread quant (contiguous HND layout)
 void quant_qk_per_thread_int8(
     nb::ndarray<nb::device::cuda> q,
     nb::ndarray<nb::device::cuda> q_int8,
@@ -877,12 +871,7 @@ void quant_qk_per_thread_int8(
     int BLKQ, int WARPQ, int BLKK, int WARPK,
     int input_dtype_code,
     uintptr_t stream_ptr,
-    int smooth_k = 0,
-    int convrot = 0,
-    uintptr_t km_scratch_ptr = 0,
-    uintptr_t km_done_ptr = 0,
-    int stabilize_k = 0,
-    uintptr_t anchor_indices_ptr = 0)
+    uintptr_t anchor_indices_ptr)
 {
     if (q.ndim() != 4 || k.ndim() != 4) {
         throw std::runtime_error("quant_qk_per_thread_int8: q and k must be 4D [B,H,L,D]");
@@ -891,9 +880,6 @@ void quant_qk_per_thread_int8(
     launch_quant_qk_per_thread_int8(
         q.data(), q_int8.data(), q_scale.data(),
         k.data(), k_int8.data(), k_scale.data(),
-        smooth_k,
-        reinterpret_cast<void *>(km_scratch_ptr),
-        reinterpret_cast<void *>(km_done_ptr),
         static_cast<int>(q.shape(0)),
         static_cast<int>(q.shape(1)),
         static_cast<int>(q.shape(2)),
@@ -903,7 +889,7 @@ void quant_qk_per_thread_int8(
         BLKQ, WARPQ, BLKK, WARPK,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
-        input_dtype_code, convrot, stabilize_k,
+        input_dtype_code,
         reinterpret_cast<void *>(anchor_indices_ptr), stream);
 }
 
@@ -924,12 +910,7 @@ void sage_sdpa_quantize(
     int cta_k,
     int input_dtype_code,
     uintptr_t stream_ptr,
-    int smooth_k = 0,
-    int convrot = 0,
-    uintptr_t km_scratch_ptr = 0,
-    uintptr_t km_done_ptr = 0,
-    int stabilize_k = 1,
-    uintptr_t anchor_indices_ptr = 0)
+    uintptr_t anchor_indices_ptr)
 {
     if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4) {
         throw std::runtime_error(
@@ -942,9 +923,9 @@ void sage_sdpa_quantize(
         throw std::runtime_error(
             "sage_sdpa_quantize: input_dtype_code must be 0 (fp32), 1 (fp16), or 2 (bf16)");
     }
-    if (stabilize_k && !smooth_k && !anchor_indices_ptr) {
+    if (!anchor_indices_ptr) {
         throw std::runtime_error(
-            "sage_sdpa_quantize: stabilize_k requires anchor_indices scratch");
+            "sage_sdpa_quantize: anchor_indices scratch is required");
     }
 
     const int B = static_cast<int>(q.shape(0));
@@ -981,14 +962,11 @@ void sage_sdpa_quantize(
     launch_quant_qk_per_thread_int8(
         q.data(), q_int8.data(), q_scale.data(),
         k.data(), k_int8.data(), k_scale.data(),
-        smooth_k,
-        reinterpret_cast<void *>(km_scratch_ptr),
-        reinterpret_cast<void *>(km_done_ptr),
         B, H_q, Lq, H_kv, Lk, D,
         BLKQ, WARPQ, cta_k, cta_k,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
-        input_dtype_code, convrot, stabilize_k,
+        input_dtype_code,
         reinterpret_cast<void *>(anchor_indices_ptr), stream);
 
     launch_quant_v_int8_kernel(
@@ -1017,7 +995,6 @@ void sage_sdpa_prequantized(
     nb::ndarray<nb::device::cuda> k_scale,
     nb::ndarray<nb::device::cuda> v_scale,
     int cta_k,
-    int is_causal,
     float sm_scale,
     int output_dtype_code,
     uintptr_t stream_ptr,
@@ -1044,13 +1021,9 @@ void sage_sdpa_prequantized(
     const int Lk = static_cast<int>(k_int8.shape(2));
     const int padded_Lk = ((Lk + cta_k - 1) / cta_k) * cta_k;
 
-    if (attn_mask.has_value() && is_causal) {
+    if (cta_k == 128 && (D == 64 || attn_mask.has_value())) {
         throw std::runtime_error(
-            "sage_sdpa_prequantized: attention mask and causal mode cannot be combined");
-    }
-    if (cta_k == 128 && (D == 64 || attn_mask.has_value() || is_causal)) {
-        throw std::runtime_error(
-            "sage_sdpa_prequantized: cta_k 128 requires unmasked, non-causal head_dim 128 or 256");
+            "sage_sdpa_prequantized: cta_k 128 requires unmasked head_dim 128 or 256");
     }
 
     if (k_int8.shape(0) != B || k_int8.shape(3) != D ||
@@ -1133,7 +1106,7 @@ void sage_sdpa_prequantized(
         ki_st_bz, ki_st_n, ki_st_h,
         v_st_bz, v_st_h, v_st_d,
         o_st_bz, o_st_n, o_st_h,
-        is_causal, sm_scale, output_dtype_code, stream);
+        sm_scale, output_dtype_code, stream);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -1152,7 +1125,6 @@ void sage_attn(
     nb::ndarray<nb::device::cuda> q_scale,
     nb::ndarray<nb::device::cuda> k_scale,
     nb::ndarray<nb::device::cuda> v_scale,
-    int is_causal,
     float sm_scale,
     int output_dtype_code,
     uintptr_t stream_ptr)
@@ -1199,13 +1171,11 @@ void sage_attn(
         k.stride(0), k.stride(2), k.stride(1),
         v.stride(0), v.stride(1), v.stride(2),
         o.stride(0), o.stride(2), o.stride(1),
-        is_causal, sm_scale, output_dtype_code, stream);
+        sm_scale, output_dtype_code, stream);
 }
 
 // Fused SageAttention SDPA: quant_qk + quant_v + sage_attn in one C++ call.
 // All scratch buffers are pre-allocated by the caller (Python frontend).
-// smooth_k: 1 = fuse K-mean reduction + subtraction into the quant kernel.
-// km_scratch_ptr / km_done_ptr: device memory for the fused mean kernel.
 void sage_sdpa(
     nb::ndarray<nb::device::cuda> q,
     nb::ndarray<nb::device::cuda> k,
@@ -1217,17 +1187,11 @@ void sage_sdpa(
     nb::ndarray<nb::device::cuda> k_scale,
     nb::ndarray<nb::device::cuda> v_int8,
     nb::ndarray<nb::device::cuda> v_scale,
-    int is_causal,
     float sm_scale,
     int input_dtype_code,
     int output_dtype_code,
     uintptr_t stream_ptr,
-    int smooth_k = 0,
-    int convrot = 0,
-    uintptr_t km_scratch_ptr = 0,
-    uintptr_t km_done_ptr = 0,
-    int stabilize_k = 1,
-    uintptr_t anchor_indices_ptr = 0,
+    uintptr_t anchor_indices_ptr,
     std::optional<nb::ndarray<nb::device::cuda>> attn_mask = std::nullopt,
     int cta_k = 0)
 {
@@ -1279,24 +1243,20 @@ void sage_sdpa(
             "sage_sdpa: output_dtype_code must be 1 (fp16) or 2 (bf16)");
     }
     if (cta_k == 0) {
-        cta_k = !attn_mask.has_value() && !is_causal && D >= 128 && Lk > 1024
+        cta_k = !attn_mask.has_value() && D >= 128 && Lk > 1024
             ? 128
             : 64;
     }
     if (cta_k != 64 && cta_k != 128) {
         throw std::runtime_error("sage_sdpa: cta_k must be 64 or 128");
     }
-    if (attn_mask.has_value() && is_causal) {
+    if (cta_k == 128 && (D == 64 || attn_mask.has_value())) {
         throw std::runtime_error(
-            "sage_sdpa: attention mask and causal mode cannot be combined");
+            "sage_sdpa: cta_k 128 requires unmasked head_dim 128 or 256");
     }
-    if (cta_k == 128 && (D == 64 || attn_mask.has_value() || is_causal)) {
+    if (!anchor_indices_ptr) {
         throw std::runtime_error(
-            "sage_sdpa: cta_k 128 requires unmasked, non-causal head_dim 128 or 256");
-    }
-    if (stabilize_k && !smooth_k && !anchor_indices_ptr) {
-        throw std::runtime_error(
-            "sage_sdpa: stabilize_k requires anchor_indices scratch");
+            "sage_sdpa: anchor_indices scratch is required");
     }
     constexpr int BLKQ = 128;
     const int WARPQ = D == 256 ? 16 : 32;
@@ -1309,14 +1269,11 @@ void sage_sdpa(
     launch_quant_qk_per_thread_int8(
         q.data(), q_int8.data(), q_scale.data(),
         k.data(), k_int8.data(), k_scale.data(),
-        smooth_k,
-        reinterpret_cast<void *>(km_scratch_ptr),
-        reinterpret_cast<void *>(km_done_ptr),
         B, H_q, Lq, H_kv, Lk, D,
         BLKQ, WARPQ, BLKK, WARPK,
         q.stride(0), q.stride(1), q.stride(2),
         k.stride(0), k.stride(1), k.stride(2),
-        input_dtype_code, convrot, stabilize_k,
+        input_dtype_code,
         reinterpret_cast<void *>(anchor_indices_ptr), stream);
 
     launch_quant_v_int8_kernel(
@@ -1354,7 +1311,7 @@ void sage_sdpa(
         ki_st_bz, ki_st_n, ki_st_h,
         v_st_bz, v_st_h, v_st_d,
         o_st_bz, o_st_n, o_st_h,
-        is_causal, sm_scale, output_dtype_code, stream);
+        sm_scale, output_dtype_code, stream);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -3575,12 +3532,7 @@ NB_MODULE(_C, m) {
           nb::arg("warp_k"),
           nb::arg("input_dtype_code"),
           nb::arg("stream_ptr"),
-          nb::arg("smooth_k") = 0,
-          nb::arg("convrot") = 0,
-          nb::arg("km_scratch_ptr") = 0,
-          nb::arg("km_done_ptr") = 0,
-          nb::arg("stabilize_k") = 0,
-          nb::arg("anchor_indices_ptr") = 0);
+          nb::arg("anchor_indices_ptr"));
 
     m.def("_sage_attn", &sage_attn,
           "Pure INT8 QK / U8-softmax / INT8-V attention kernel",
@@ -3591,7 +3543,6 @@ NB_MODULE(_C, m) {
           nb::arg("q_scale"),
           nb::arg("k_scale"),
           nb::arg("v_scale"),
-          nb::arg("is_causal"),
           nb::arg("sm_scale"),
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"));
@@ -3610,12 +3561,7 @@ NB_MODULE(_C, m) {
           nb::arg("cta_k"),
           nb::arg("input_dtype_code"),
           nb::arg("stream_ptr"),
-          nb::arg("smooth_k") = 0,
-          nb::arg("convrot") = 0,
-          nb::arg("km_scratch_ptr") = 0,
-          nb::arg("km_done_ptr") = 0,
-          nb::arg("stabilize_k") = 1,
-          nb::arg("anchor_indices_ptr") = 0);
+          nb::arg("anchor_indices_ptr"));
 
     m.def("sage_sdpa_prequantized", &sage_sdpa_prequantized,
           "Run pure-INT8 SDPA from prequantized Q/K/V",
@@ -3627,7 +3573,6 @@ NB_MODULE(_C, m) {
           nb::arg("k_scale"),
           nb::arg("v_scale"),
           nb::arg("cta_k"),
-          nb::arg("is_causal"),
           nb::arg("sm_scale"),
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"),
@@ -3645,17 +3590,11 @@ NB_MODULE(_C, m) {
           nb::arg("k_scale"),
           nb::arg("v_int8"),
           nb::arg("v_scale"),
-          nb::arg("is_causal"),
           nb::arg("sm_scale"),
           nb::arg("input_dtype_code"),
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"),
-          nb::arg("smooth_k") = 0,
-          nb::arg("convrot") = 0,
-          nb::arg("km_scratch_ptr") = 0,
-          nb::arg("km_done_ptr") = 0,
-          nb::arg("stabilize_k") = 1,
-          nb::arg("anchor_indices_ptr") = 0,
+          nb::arg("anchor_indices_ptr"),
           nb::arg("attn_mask") = nb::none(),
           nb::arg("cta_k") = 0);
 

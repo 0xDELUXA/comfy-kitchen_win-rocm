@@ -37,7 +37,6 @@ class PrequantizedInt8Attention:
     v_scale: torch.Tensor
     original_head_dim: int
     input_dtype: torch.dtype
-    is_causal: bool
     attention_scale: float
     cta_k: int
     attn_mask: torch.Tensor | None
@@ -51,10 +50,9 @@ def _select_cta_k(
     kernel_head_dim: int,
     kv_length: int,
     *,
-    is_causal: bool,
     has_mask: bool,
 ) -> int:
-    if not has_mask and not is_causal and kernel_head_dim >= 128 and kv_length > 1024:
+    if not has_mask and kernel_head_dim >= 128 and kv_length > 1024:
         return LARGE_CTA_K
     return CTA_K
 
@@ -71,7 +69,6 @@ def _validate_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    is_causal: bool,
     attn_mask: torch.Tensor | None,
 ) -> torch.Tensor | None:
     if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
@@ -109,12 +106,8 @@ def _validate_inputs(
         raise ValueError(f"head_dim must be in [1, 256], got {head_dim}")
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("the last dimension of q, k, and v must be contiguous")
-    if is_causal and q_length != kv_length:
-        raise ValueError("causal INT8 attention requires equal q and k/v sequence lengths")
     if attn_mask is None:
         return None
-    if is_causal:
-        raise ValueError("attn_mask and is_causal cannot be used together")
     if attn_mask.device != q.device:
         raise ValueError("attn_mask must be on the same CUDA device as q, k, and v")
     if attn_mask.dtype not in (torch.bool, torch.float16, torch.bfloat16, torch.float32):
@@ -133,14 +126,10 @@ def _int8_attention_cuda(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    is_causal: bool = False,
     scale: float | None = None,
-    smooth_k: bool = False,
-    convrot: bool = False,
-    stabilize_k: bool = True,
     attn_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    attn_mask = _validate_inputs(q, k, v, is_causal, attn_mask)
+    attn_mask = _validate_inputs(q, k, v, attn_mask)
 
     original_head_dim = q.shape[-1]
     if original_head_dim <= 64:
@@ -164,7 +153,6 @@ def _int8_attention_cuda(
     cta_k = _select_cta_k(
         kernel_head_dim,
         kv_length,
-        is_causal=is_causal,
         has_mask=attn_mask is not None,
     )
     padded_k_length = _pad_to_cta_k(kv_length, cta_k)
@@ -198,22 +186,10 @@ def _int8_attention_cuda(
         batch, q_heads, q_length, kernel_head_dim, dtype=output_dtype, device=q.device
     )
 
-    km_scratch_ptr = 0
-    km_done_ptr = 0
-    if smooth_k:
-        km_scratch = torch.empty(
-            batch * kv_heads * kernel_head_dim, dtype=torch.float32, device=q.device
-        )
-        km_done = torch.empty(batch * kv_heads, dtype=torch.int32, device=q.device)
-        km_scratch_ptr = km_scratch.data_ptr()
-        km_done_ptr = km_done.data_ptr()
-
-    anchor_indices_ptr = 0
-    if stabilize_k and not smooth_k:
-        anchor_indices = torch.empty(
-            batch, kv_heads, dtype=torch.int32, device=q.device
-        )
-        anchor_indices_ptr = anchor_indices.data_ptr()
+    anchor_indices = torch.empty(
+        batch, kv_heads, dtype=torch.int32, device=q.device
+    )
+    anchor_indices_ptr = anchor_indices.data_ptr()
 
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
     if attn_mask is None:
@@ -228,16 +204,10 @@ def _int8_attention_cuda(
             _cuda_backend._wrap_for_dlpack(k_scale),
             _cuda_backend._wrap_for_dlpack(v_int8),
             _cuda_backend._wrap_for_dlpack(v_scale),
-            int(is_causal),
             attention_scale,
             DTYPE_TO_CODE[q.dtype],
             DTYPE_TO_CODE[output_dtype],
             stream_ptr,
-            int(smooth_k),
-            int(convrot),
-            km_scratch_ptr,
-            km_done_ptr,
-            int(stabilize_k),
             anchor_indices_ptr,
             cta_k=cta_k,
         )
@@ -253,16 +223,10 @@ def _int8_attention_cuda(
             _cuda_backend._wrap_for_dlpack(k_scale),
             _cuda_backend._wrap_for_dlpack(v_int8),
             _cuda_backend._wrap_for_dlpack(v_scale),
-            int(is_causal),
             attention_scale,
             DTYPE_TO_CODE[q.dtype],
             DTYPE_TO_CODE[output_dtype],
             stream_ptr,
-            int(smooth_k),
-            int(convrot),
-            km_scratch_ptr,
-            km_done_ptr,
-            int(stabilize_k),
             anchor_indices_ptr,
             _cuda_backend._wrap_for_dlpack(attn_mask),
             cta_k=cta_k,
@@ -277,11 +241,7 @@ def prequantize_int8_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    is_causal: bool = False,
     scale: float | None = None,
-    smooth_k: bool = False,
-    convrot: bool = False,
-    stabilize_k: bool = True,
     attn_mask: torch.Tensor | None = None,
 ) -> PrequantizedInt8Attention:
     """Quantize Q, K, and V without allocating the attention output.
@@ -296,7 +256,7 @@ def prequantize_int8_attention(
     remains the lower-overhead single-call path when early Q/K/V release is not
     needed.
     """
-    attn_mask = _validate_inputs(q, k, v, is_causal, attn_mask)
+    attn_mask = _validate_inputs(q, k, v, attn_mask)
 
     original_head_dim = q.shape[-1]
     input_dtype = q.dtype
@@ -321,7 +281,6 @@ def prequantize_int8_attention(
     cta_k = _select_cta_k(
         kernel_head_dim,
         kv_length,
-        is_causal=is_causal,
         has_mask=attn_mask is not None,
     )
     padded_k_length = _pad_to_cta_k(kv_length, cta_k)
@@ -354,24 +313,10 @@ def prequantize_int8_attention(
         device=q.device,
     )
 
-    km_scratch_ptr = 0
-    km_done_ptr = 0
-    if smooth_k:
-        km_scratch = torch.empty(
-            batch * kv_heads * kernel_head_dim,
-            dtype=torch.float32,
-            device=q.device,
-        )
-        km_done = torch.empty(batch * kv_heads, dtype=torch.int32, device=q.device)
-        km_scratch_ptr = km_scratch.data_ptr()
-        km_done_ptr = km_done.data_ptr()
-
-    anchor_indices_ptr = 0
-    if stabilize_k and not smooth_k:
-        anchor_indices = torch.empty(
-            batch, kv_heads, dtype=torch.int32, device=q.device
-        )
-        anchor_indices_ptr = anchor_indices.data_ptr()
+    anchor_indices = torch.empty(
+        batch, kv_heads, dtype=torch.int32, device=q.device
+    )
+    anchor_indices_ptr = anchor_indices.data_ptr()
 
     stream_ptr = torch.cuda.current_stream(q.device).cuda_stream
     _cuda_backend._C.sage_sdpa_quantize(
@@ -387,11 +332,6 @@ def prequantize_int8_attention(
         cta_k,
         DTYPE_TO_CODE[input_dtype],
         stream_ptr,
-        int(smooth_k),
-        int(convrot),
-        km_scratch_ptr,
-        km_done_ptr,
-        int(stabilize_k),
         anchor_indices_ptr,
     )
 
@@ -404,7 +344,6 @@ def prequantize_int8_attention(
         v_scale=v_scale,
         original_head_dim=original_head_dim,
         input_dtype=input_dtype,
-        is_causal=is_causal,
         attention_scale=attention_scale,
         cta_k=cta_k,
         attn_mask=attn_mask,
@@ -434,8 +373,6 @@ def int8_attention_from_prequantized(
     if any(tensor.device != quantized.q.device for tensor in packed_tensors[1:]):
         raise ValueError("prequantized INT8 attention tensors must be on the same CUDA device")
     if quantized.attn_mask is not None:
-        if quantized.is_causal:
-            raise ValueError("attn_mask and is_causal cannot be used together")
         if quantized.attn_mask.device != quantized.q.device:
             raise ValueError("attn_mask must be on the same CUDA device as the packed tensors")
     if not is_available(quantized.q.device):
@@ -466,7 +403,6 @@ def int8_attention_from_prequantized(
         _cuda_backend._wrap_for_dlpack(quantized.k_scale),
         _cuda_backend._wrap_for_dlpack(quantized.v_scale),
         quantized.cta_k,
-        int(quantized.is_causal),
         quantized.attention_scale,
         DTYPE_TO_CODE[output_dtype],
         stream_ptr,
@@ -488,21 +424,13 @@ def _op_int8_attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    is_causal: bool,
     scale: float | None,
-    smooth_k: bool,
-    convrot: bool,
-    stabilize_k: bool,
 ) -> torch.Tensor:
     return _int8_attention_cuda(
         q,
         k,
         v,
-        is_causal=is_causal,
         scale=scale,
-        smooth_k=smooth_k,
-        convrot=convrot,
-        stabilize_k=stabilize_k,
         attn_mask=None,
     )
 
@@ -512,11 +440,7 @@ def _op_int8_attention_fake(
     q,
     k,
     v,
-    is_causal,
     scale,
-    smooth_k,
-    convrot,
-    stabilize_k,
 ):
     return q.new_empty(q.shape)
 
@@ -528,18 +452,12 @@ def _op_int8_attention_masked(
     v: torch.Tensor,
     attn_mask: torch.Tensor,
     scale: float | None,
-    smooth_k: bool,
-    convrot: bool,
-    stabilize_k: bool,
 ) -> torch.Tensor:
     return _int8_attention_cuda(
         q,
         k,
         v,
         scale=scale,
-        smooth_k=smooth_k,
-        convrot=convrot,
-        stabilize_k=stabilize_k,
         attn_mask=attn_mask,
     )
 
@@ -551,9 +469,6 @@ def _op_int8_attention_masked_fake(
     v,
     attn_mask,
     scale,
-    smooth_k,
-    convrot,
-    stabilize_k,
 ):
     return q.new_empty(q.shape)
 
@@ -563,11 +478,7 @@ def int8_attention(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    is_causal: bool = False,
     scale: float | None = None,
-    smooth_k: bool = False,
-    convrot: bool = False,
-    stabilize_k: bool = True,
     attn_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute inference SDPA with signed INT8 Q/K/V and unsigned INT8 P.
@@ -575,19 +486,15 @@ def int8_attention(
     Inputs use ``[batch, heads, sequence, head_dim]`` layout. Grouped-query
     attention and unequal non-causal Q/K sequence lengths are supported. Head
     dimensions are padded to the kernel's 64-, 128-, or 256-wide tile and
-    sliced back on return; 64, 128, and 256 take the zero-copy dimension path. When
-    ``convrot`` is true, Q and K receive the same fused block-Hadamard rotation
-    before INT8 quantization, preserving their exact dot products while
-    reducing quantization outliers. K lengths up to 256 use low-overhead H4
-    blocks and longer D64 attention uses H64. The common D128 path uses a fixed
-    signed H128 transform; smooth-K and padded D256 retain plain H128.
-    ``smooth_k`` subtracts each key channel's sequence mean before quantization;
-    softmax makes this score shift exact, but the extra reduction is disabled by
-    default for throughput. By default, ``stabilize_k`` samples K on the GPU and
-    subtracts a representative key only when doing so improves the quantization
-    range. This model-independent shift is also exactly softmax-invariant and
-    uses one int32 of temporary storage per batch/KV-head. ``smooth_k`` takes
-    precedence when both options are enabled.
+    sliced back on return; 64, 128, and 256 take the zero-copy dimension path.
+    Q and K receive the same fused block-Hadamard rotation before INT8
+    quantization, preserving their exact dot products while reducing
+    quantization outliers. K lengths up to 256 use low-overhead H4 blocks and
+    longer D64 attention uses H64. The common D128 path uses a fixed signed H128
+    transform, while padded D256 uses plain H128. The kernel samples K on the
+    GPU and subtracts a representative key only when doing so improves the
+    quantization range. This model-independent shift is exactly
+    softmax-invariant and uses one int32 of temporary storage per batch/KV-head.
     Softmax score, maximum, exponential, denominator, reciprocal, and V-scale
     arithmetic is FP32. This path does not allocate FP8 tensors or execute FP8
     MMA instructions.
@@ -597,21 +504,12 @@ def int8_attention(
             q,
             k,
             v,
-            is_causal,
             scale,
-            smooth_k,
-            convrot,
-            stabilize_k,
         )
-    if is_causal:
-        raise ValueError("attn_mask and is_causal cannot be used together")
     return torch.ops.comfy_kitchen.int8_attention_masked(
         q,
         k,
         v,
         attn_mask,
         scale,
-        smooth_k,
-        convrot,
-        stabilize_k,
     )

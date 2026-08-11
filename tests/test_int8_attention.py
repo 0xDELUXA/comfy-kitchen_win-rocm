@@ -39,10 +39,9 @@ def test_int8_attention_availability_is_bool():
 
 def test_int8_attention_cta_k_selection():
     select = sage_attention_module._select_cta_k
-    assert select(128, 1025, is_causal=False, has_mask=False) == 128
-    assert select(64, 1025, is_causal=False, has_mask=False) == 64
-    assert select(128, 1025, is_causal=True, has_mask=False) == 64
-    assert select(128, 1025, is_causal=False, has_mask=True) == 64
+    assert select(128, 1025, has_mask=False) == 128
+    assert select(64, 1025, has_mask=False) == 64
+    assert select(128, 1025, has_mask=True) == 64
 
 
 def test_prequantized_attention_rejects_cpu_tensors():
@@ -55,7 +54,6 @@ def test_prequantized_attention_rejects_cpu_tensors():
         v_scale=torch.empty(64, dtype=torch.float32),
         original_head_dim=64,
         input_dtype=torch.float16,
-        is_causal=False,
         attention_scale=0.125,
         cta_k=64,
         attn_mask=None,
@@ -116,19 +114,20 @@ def test_int8_attention_matches_sdpa(dtype, head_dim):
     assert _nrmse(actual, expected) < 0.03
 
 
-@pytest.mark.parametrize("option", ["softmax_dtype", "post_pv_dtype"])
-def test_int8_attention_has_no_low_precision_options(option):
+@pytest.mark.parametrize(
+    "option",
+    [
+        "softmax_dtype",
+        "post_pv_dtype",
+        "convrot",
+        "stabilize_k",
+        "smooth_k",
+        "is_causal",
+    ],
+)
+def test_int8_attention_rejects_removed_options(option):
     with pytest.raises(TypeError):
         ck.int8_attention(None, None, None, **{option: "input"})
-
-
-@requires_int8_attention
-def test_int8_attention_rejects_mask_with_causal_mode():
-    q, k, v = _qkv(1, 4, 4, 64, 64, 64)
-    mask = torch.ones(1, 1, 64, 64, dtype=torch.bool, device="cuda")
-
-    with pytest.raises(ValueError, match="cannot be used together"):
-        ck.int8_attention(q, k, v, attn_mask=mask, is_causal=True)
 
 
 @requires_int8_attention
@@ -147,6 +146,30 @@ def test_int8_attention_gqa_and_unequal_lengths():
 
 
 @requires_int8_attention
+@pytest.mark.parametrize("masked", [False, True])
+def test_int8_attention_batch_two_direct_and_prequantized(masked):
+    q, k, v = _qkv(2, 8, 2, 193, 257, 128)
+    mask = None
+    if masked:
+        mask = torch.zeros(2, 1, 1, 257, device="cuda", dtype=torch.bfloat16)
+        mask[0, ..., 240:] = -torch.inf
+        mask[1, ..., :17] = -torch.inf
+
+    actual = ck.int8_attention(q, k, v, attn_mask=mask)
+    quantized = ck.prequantize_int8_attention(q, k, v, attn_mask=mask)
+    prequantized = ck.int8_attention_from_prequantized(quantized)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q,
+        k.repeat_interleave(4, dim=1),
+        v.repeat_interleave(4, dim=1),
+        attn_mask=mask,
+    )
+
+    assert torch.equal(prequantized, actual)
+    assert _nrmse(actual, expected) < 0.03
+
+
+@requires_int8_attention
 @pytest.mark.parametrize("head_dim", [64, 128, 256])
 @pytest.mark.parametrize("mask_dtype", [torch.bool, torch.float16, torch.bfloat16])
 def test_int8_attention_mask_gqa_broadcast_and_fully_masked_row(head_dim, mask_dtype):
@@ -159,7 +182,7 @@ def test_int8_attention_mask_gqa_broadcast_and_fully_masked_row(head_dim, mask_d
         mask[..., 220:] = -torch.inf
         mask[..., 7, :] = -torch.inf
 
-    actual = ck.int8_attention(q, k, v, attn_mask=mask, convrot=True)
+    actual = ck.int8_attention(q, k, v, attn_mask=mask)
     baseline_mask = mask
     if mask.dtype != torch.bool and mask.dtype != q.dtype:
         baseline_mask = mask.to(q.dtype)
@@ -189,7 +212,7 @@ def test_int8_attention_key_broadcast_mask(mask_dtype):
         )
         mask[..., 240:] = -torch.inf
 
-    actual = ck.int8_attention(q, k, v, attn_mask=mask, convrot=True)
+    actual = ck.int8_attention(q, k, v, attn_mask=mask)
     baseline_mask = mask
     if mask.dtype != torch.bool and mask.dtype != q.dtype:
         baseline_mask = mask.to(q.dtype)
@@ -215,30 +238,9 @@ def test_int8_attention_fully_masked_key_broadcast_is_zero(mask_dtype):
             (1, 1, 1, 97), -torch.inf, dtype=mask_dtype, device="cuda"
         )
 
-    actual = ck.int8_attention(q, k, v, attn_mask=mask, convrot=True)
+    actual = ck.int8_attention(q, k, v, attn_mask=mask)
 
     assert torch.count_nonzero(actual) == 0
-
-
-@requires_int8_attention
-@pytest.mark.parametrize(
-    "heads,length,head_dim",
-    [(4, 257, 64), (24, 1024, 128), (56, 4096, 128)],
-)
-def test_int8_attention_causal(heads, length, head_dim):
-    q, k, v = _qkv(1, heads, heads, length, length, head_dim)
-    actual = ck.int8_attention(q, k, v, is_causal=True)
-    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
-    assert _nrmse(actual, expected) < 0.03
-
-
-@requires_int8_attention
-def test_int8_attention_smooth_k():
-    q, k, v = _qkv(1, 8, 8, 257, 257, 128)
-    k.add_(torch.linspace(-2, 2, 128, device="cuda", dtype=k.dtype))
-    actual = ck.int8_attention(q, k, v, smooth_k=True)
-    expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-    assert _nrmse(actual, expected) < 0.03
 
 
 @requires_int8_attention
@@ -252,29 +254,21 @@ def test_int8_attention_stabilizes_large_common_key_component():
     k.add_(common_key.to(k.dtype))
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
-    stabilized = ck.int8_attention(q, k, v, convrot=True)
-    unstabilized = ck.int8_attention(
-        q, k, v, convrot=True, stabilize_k=False
-    )
+    actual = ck.int8_attention(q, k, v)
 
-    stabilized_error = _nrmse(stabilized, expected)
-    unstabilized_error = _nrmse(unstabilized, expected)
-    assert torch.isfinite(stabilized).all()
-    assert stabilized_error < 0.03
-    assert not torch.isfinite(unstabilized).all() or (
-        stabilized_error < unstabilized_error * 0.25
-    )
+    assert torch.isfinite(actual).all()
+    assert _nrmse(actual, expected) < 0.03
 
 
 @requires_int8_attention
-def test_int8_attention_stabilization_preserves_normal_key_path():
+def test_int8_attention_stabilization_is_deterministic():
     torch.manual_seed(11)
     q, k, v = _qkv(1, 8, 8, 257, 257, 128)
 
-    stabilized = ck.int8_attention(q, k, v, convrot=True)
-    original = ck.int8_attention(q, k, v, convrot=True, stabilize_k=False)
+    first = ck.int8_attention(q, k, v)
+    second = ck.int8_attention(q, k, v)
 
-    assert torch.equal(stabilized, original)
+    assert torch.equal(first, second)
 
 
 @requires_int8_attention
@@ -287,30 +281,23 @@ def test_int8_attention_stabilization_preserves_normal_key_path():
             "head_dim": 64,
             "dtype": torch.float16,
         },
-        {"q_length": 193, "kv_length": 1281, "head_dim": 128, "convrot": True},
+        {"q_length": 193, "kv_length": 1281, "head_dim": 128},
         {
             "q_length": 193,
             "kv_length": 257,
             "head_dim": 96,
-            "smooth_k": True,
             "dtype": torch.float32,
         },
         {
             "q_length": 193,
             "kv_length": 1281,
-            "head_dim": 128,
-            "stabilize_k": False,
+            "head_dim": 256,
         },
-        {"q_length": 257, "kv_length": 257, "head_dim": 256, "is_causal": True},
+        {"q_length": 257, "kv_length": 257, "head_dim": 256},
     ],
 )
 def test_prequantized_attention_is_bitwise_identical_to_fused(configuration):
     torch.manual_seed(123)
-    options = {
-        key: configuration[key]
-        for key in ("convrot", "smooth_k", "stabilize_k", "is_causal")
-        if key in configuration
-    }
     q, k, v = _qkv(
         1,
         8,
@@ -321,8 +308,8 @@ def test_prequantized_attention_is_bitwise_identical_to_fused(configuration):
         configuration.get("dtype", torch.bfloat16),
     )
 
-    expected = ck.int8_attention(q, k, v, **options)
-    quantized = ck.prequantize_int8_attention(q, k, v, **options)
+    expected = ck.int8_attention(q, k, v)
+    quantized = ck.prequantize_int8_attention(q, k, v)
     actual = ck.int8_attention_from_prequantized(quantized)
 
     assert torch.equal(actual, expected)
@@ -336,13 +323,12 @@ def test_prequantized_masked_attention_is_bitwise_identical_to_fused():
     )
     mask[..., 240:] = -torch.inf
 
-    expected = ck.int8_attention(q, k, v, attn_mask=mask, convrot=True)
+    expected = ck.int8_attention(q, k, v, attn_mask=mask)
     quantized = ck.prequantize_int8_attention(
         q,
         k,
         v,
         attn_mask=mask,
-        convrot=True,
     )
     actual = ck.int8_attention_from_prequantized(quantized)
 
@@ -352,10 +338,10 @@ def test_prequantized_masked_attention_is_bitwise_identical_to_fused():
 @requires_int8_attention
 def test_prequantized_attention_releases_float_inputs_before_execution():
     q, k, v = _qkv(1, 8, 2, 513, 769, 128)
-    expected = ck.int8_attention(q, k, v, convrot=True)
+    expected = ck.int8_attention(q, k, v)
     input_references = tuple(weakref.ref(tensor) for tensor in (q, k, v))
 
-    quantized = ck.prequantize_int8_attention(q, k, v, convrot=True)
+    quantized = ck.prequantize_int8_attention(q, k, v)
     del q, k, v
     gc.collect()
     assert all(reference() is None for reference in input_references)
@@ -378,35 +364,34 @@ def test_prequantized_attention_releases_float_inputs_before_execution():
 def test_int8_attention_torch_compile_fullgraph():
     q, k, v = _qkv(1, 4, 4, 129, 129, 64)
     compiled = torch.compile(
-        lambda q_, k_, v_: ck.int8_attention(q_, k_, v_, convrot=True),
+        lambda q_, k_, v_: ck.int8_attention(q_, k_, v_),
         backend="eager",
         fullgraph=True,
     )
     actual = compiled(q, k, v)
-    expected = ck.int8_attention(q, k, v, convrot=True)
+    expected = ck.int8_attention(q, k, v)
     torch.testing.assert_close(actual, expected)
 
 
 @requires_int8_attention
-@pytest.mark.parametrize("smooth_k", [False, True])
-def test_int8_attention_cuda_graph(smooth_k):
+def test_int8_attention_cuda_graph():
     q, k, v = _qkv(1, 4, 4, 129, 129, 64)
     warmup_stream = torch.cuda.Stream()
     warmup_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup_stream):
-        ck.int8_attention(q, k, v, smooth_k=smooth_k)
+        ck.int8_attention(q, k, v)
     torch.cuda.current_stream().wait_stream(warmup_stream)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = ck.int8_attention(q, k, v, smooth_k=smooth_k)
+        actual = ck.int8_attention(q, k, v)
     graph.replay()
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
     assert _nrmse(actual, expected) < 0.03
 
 
 @requires_int8_attention
-def test_convrot_improves_outlier_quality():
+def test_rotation_handles_outliers():
     torch.manual_seed(1)
     q, k, v = _qkv(1, 8, 8, 513, 513, 128)
     q[..., 0].mul_(12)
@@ -415,14 +400,6 @@ def test_convrot_improves_outlier_quality():
     k.mul_(k.float().square().mean(-1, keepdim=True).rsqrt().to(k.dtype))
     expected = torch.nn.functional.scaled_dot_product_attention(q, k, v)
 
-    baseline = ck.int8_attention(q, k, v)
-    rotated = ck.int8_attention(q, k, v, convrot=True)
+    actual = ck.int8_attention(q, k, v)
 
-    assert _nrmse(rotated, expected) < _nrmse(baseline, expected) * 0.95
-
-
-@requires_int8_attention
-def test_causal_rejects_unequal_lengths():
-    q, k, v = _qkv(1, 4, 4, 64, 96, 64)
-    with pytest.raises(ValueError, match="equal q and k/v sequence lengths"):
-        ck.int8_attention(q, k, v, is_causal=True)
+    assert _nrmse(actual, expected) < 0.03
