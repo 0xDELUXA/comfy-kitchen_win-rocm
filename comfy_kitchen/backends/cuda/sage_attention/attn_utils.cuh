@@ -661,6 +661,7 @@ __device__ __forceinline__ void update_mdo_i32_u8(
   for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
     for (uint32_t k = 0; k < 2; k++) {
+      const float m_prev = m[fq][k];
       int32_t m_temp_i32 = INT_MIN;
 #pragma unroll
       for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
@@ -675,8 +676,20 @@ __device__ __forceinline__ void update_mdo_i32_u8(
       m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x1));
       m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x2));
       const float tile_m = m_temp;
-      const float tile_scale =
-          math::ptx_exp2(tile_m - kFixedSoftmaxAnchor);
+      m[fq][k] = max(m_prev, tile_m);
+
+      const float smaller_scale =
+          math::ptx_exp2(-fabsf(m_prev - tile_m));
+      const float o_scale = m_prev < tile_m ? smaller_scale : 1.0f;
+      const float tile_scale = tile_m < m_prev ? smaller_scale : 1.0f;
+      d[fq][k] *= o_scale;
+#pragma unroll
+      for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
+        RO[fq][fv][k * 2] *= o_scale;
+        RO[fq][fv][k * 2 + 1] *= o_scale;
+        RO[fq][fv][k * 2 + 4] *= o_scale;
+        RO[fq][fv][k * 2 + 5] *= o_scale;
+      }
 
       const float negative_m = -tile_m;
 #pragma unroll
