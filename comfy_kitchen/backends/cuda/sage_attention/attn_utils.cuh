@@ -609,20 +609,20 @@ RS_32_to_8(float RS[][num_tiles_k][8], uint32_t RS_8[][num_tiles_k / 2][4]) {
 __device__ __forceinline__ uint32_t pack_u8x4(float a, float b, float c,
                                               float d) {
   uint32_t qa, qb, qc, qd;
-  asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qa) : "f"(a));
-  asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qb) : "f"(b));
-  asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qc) : "f"(c));
-  asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qd) : "f"(d));
-  uint32_t qab, qcd, packed;
-  asm volatile("prmt.b32 %0, %1, %2, 0x5410;"
-               : "=r"(qab)
-               : "r"(qa), "r"(qb));
-  asm volatile("prmt.b32 %0, %1, %2, 0x5410;"
-               : "=r"(qcd)
-               : "r"(qc), "r"(qd));
-  asm volatile("prmt.b32 %0, %1, %2, 0x6420;"
+  // Keep the FP32-to-integer conversions adjacent to the two packed U8
+  // conversions. ptxas recognizes each pair as one F2IP instruction on
+  // Ampere and newer, instead of emitting four scalar F2IP plus two I2IP.
+  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qa) : "f"(a));
+  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qb) : "f"(b));
+  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qc) : "f"(c));
+  asm volatile("cvt.rni.s32.f32 %0, %1;" : "=r"(qd) : "f"(d));
+  uint32_t qdc, packed;
+  asm volatile("cvt.pack.sat.u8.s32.b32 %0, %1, %2, 0;"
+               : "=r"(qdc)
+               : "r"(qd), "r"(qc));
+  asm volatile("cvt.pack.sat.u8.s32.b32 %0, %1, %2, %3;"
                : "=r"(packed)
-               : "r"(qab), "r"(qcd));
+               : "r"(qb), "r"(qa), "r"(qdc));
   return packed;
 }
 
@@ -630,6 +630,8 @@ struct PackedU8RowSum {
   uint32_t probabilities;
   float denominator;
 };
+
+constexpr float kFixedSoftmaxAnchor = 64.0f;
 
 __device__ __forceinline__ PackedU8RowSum
 pack_scaled_exp2_u8x4(const int32_t a, const int32_t b, const int32_t c,
@@ -659,7 +661,6 @@ __device__ __forceinline__ void update_mdo_i32_u8(
   for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
     for (uint32_t k = 0; k < 2; k++) {
-      const float m_prev = m[fq][k];
       int32_t m_temp_i32 = INT_MIN;
 #pragma unroll
       for (uint32_t fk = 0; fk < num_tiles_k; fk++) {
@@ -674,20 +675,8 @@ __device__ __forceinline__ void update_mdo_i32_u8(
       m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x1));
       m_temp = max(m_temp, __shfl_xor_sync(0xffffffff, m_temp, 0x2));
       const float tile_m = m_temp;
-      m[fq][k] = max(m_prev, tile_m);
-
-      const float smaller_scale =
-          math::ptx_exp2(-fabsf(m_prev - tile_m));
-      const float o_scale = m_prev < tile_m ? smaller_scale : 1.0f;
-      const float tile_scale = tile_m < m_prev ? smaller_scale : 1.0f;
-      d[fq][k] *= o_scale;
-#pragma unroll
-      for (uint32_t fv = 0; fv < num_tiles_v; fv++) {
-        RO[fq][fv][k * 2] *= o_scale;
-        RO[fq][fv][k * 2 + 1] *= o_scale;
-        RO[fq][fv][k * 2 + 4] *= o_scale;
-        RO[fq][fv][k * 2 + 5] *= o_scale;
-      }
+      const float tile_scale =
+          math::ptx_exp2(tile_m - kFixedSoftmaxAnchor);
 
       const float negative_m = -tile_m;
 #pragma unroll
