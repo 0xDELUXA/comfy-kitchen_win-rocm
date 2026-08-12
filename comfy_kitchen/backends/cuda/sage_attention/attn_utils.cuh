@@ -631,8 +631,6 @@ struct PackedU8RowSum {
   float denominator;
 };
 
-constexpr float kFixedSoftmaxAnchor = 64.0f;
-
 __device__ __forceinline__ PackedU8RowSum
 pack_scaled_exp2_u8x4(const int32_t a, const int32_t b, const int32_t c,
                       const int32_t d, const float scale,

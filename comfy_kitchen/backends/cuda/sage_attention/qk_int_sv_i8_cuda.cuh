@@ -218,14 +218,8 @@ __global__ void qk_int_sv_i8_attn_kernel(
   for (uint32_t fq = 0; fq < num_tiles_q; fq++) {
 #pragma unroll
     for (uint32_t k = 0; k < 2; k++) {
-      if constexpr (use_fused_fp32_probabilities &&
-                    mask_mode == MaskMode::kNone) {
-        m[fq][k] = kFixedSoftmaxAnchor;
-        d[fq][k] = 0.0f;
-      } else {
-        m[fq][k] = -50000.0f;
-        d[fq][k] = 1.0f;
-      }
+      m[fq][k] = -50000.0f;
+      d[fq][k] = 1.0f;
       valid[fq][k] = false;
     }
   }
