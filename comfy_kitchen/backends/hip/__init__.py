@@ -66,6 +66,8 @@ __all__ = [
     "has_wmma",
     "int8_linear",
     "int8_attention_is_available",
+    "flash_attention_decode_is_available",
+    "flash_decode",
     "is_available",
     "sage_int8_attend",
     "sage_int8_quantize",
@@ -2048,6 +2050,49 @@ def int8_attention_is_available() -> bool:
     RDNA2 declines it the way it declines the GEMMs.
     """
     return has_wmma()
+
+
+def flash_attention_decode_is_available() -> bool:
+    """Whether the BF16 decode attention kernel can run here.
+
+    The kernel uses no matrix cores, so is_available() would be the natural
+    gate, but RDNA2 has no bf16 and a caller that asks it to run there builds
+    the KV cache in another dtype, which this kernel declines. has_wmma() marks
+    the line where bf16 arrives, the same line the CUDA backend draws at SM80.
+    The attribute test catches an extension built before the kernel existed,
+    which is otherwise an AttributeError at dispatch.
+    """
+    return has_wmma() and hasattr(_C, "flash_attention_decode")
+
+
+def flash_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    kv_lengths: torch.Tensor,
+    output: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    softmax_lse_accum: torch.Tensor,
+    output_accum: torch.Tensor,
+    num_splits: int,
+) -> None:
+    """Decode attention into ``output``. See ops/flash_decode.hip.
+
+    The caller owns the reshaping and the split workspace; this is the raw
+    launch so both backends can share comfy_kitchen/flash_attention.py.
+    """
+    _C.flash_attention_decode(
+        _dl(q),
+        _dl(k),
+        _dl(v),
+        _dl(kv_lengths),
+        _dl(output),
+        _dl(softmax_lse),
+        _dl(softmax_lse_accum),
+        _dl(output_accum),
+        num_splits,
+        _stream(q),
+    )
 
 
 def _sage_buffers(q: torch.Tensor, k: torch.Tensor, cta_k: int):
