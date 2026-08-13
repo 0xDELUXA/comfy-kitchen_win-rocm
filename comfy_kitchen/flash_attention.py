@@ -6,6 +6,21 @@ import torch
 
 from .backends import cuda as _cuda_backend
 
+_MINIMUM_CAPABILITY = (8, 0)
+
+
+def is_available(device: torch.device | int | None = None) -> bool:
+    """Return whether flash attention decode is available on this GPU."""
+    if not torch.cuda.is_available() or getattr(torch.version, "hip", None):
+        return False
+    if (
+        not _cuda_backend._EXT_AVAILABLE
+        or _cuda_backend._C is None
+        or not hasattr(_cuda_backend._C, "flash_attention_decode")
+    ):
+        return False
+    return torch.cuda.get_device_capability(device) >= _MINIMUM_CAPABILITY
+
 
 def _num_splits(batch_heads: int, kv_capacity: int, multiprocessors: int) -> int:
     blocks = (kv_capacity + 127) // 128
@@ -33,7 +48,7 @@ def flash_attention_decode(
     """Decode attention for BF16 [batch, length, heads, 128] tensors."""
     batch, _, query_heads, head_dim = q.shape
     _, kv_capacity, kv_heads, _ = k.shape
-    if not _cuda_backend._EXT_AVAILABLE or torch.cuda.get_device_capability(q.device) < (8, 0):
+    if not is_available(q.device):
         raise RuntimeError("flash_attention_decode requires the CUDA extension on SM80 or newer")
 
     groups = query_heads // kv_heads

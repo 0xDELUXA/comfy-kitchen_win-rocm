@@ -2,12 +2,10 @@ import pytest
 import torch
 
 import comfy_kitchen as ck
-from comfy_kitchen.backends import cuda as cuda_backend
+import comfy_kitchen.flash_attention as flash_attention_module
 
 requires_flash_decode = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not cuda_backend._EXT_AVAILABLE
-    or torch.cuda.get_device_capability() < (8, 0),
+    not ck.flash_attention_decode_is_available(),
     reason="requires the CUDA extension on SM80 or newer",
 )
 
@@ -22,6 +20,40 @@ def _reference(q, k, v, lengths):
         output = torch.nn.functional.scaled_dot_product_attention(query, key, value)
         outputs.append(output.squeeze(0).transpose(0, 1))
     return torch.stack(outputs)
+
+
+def test_flash_attention_decode_availability_is_bool():
+    assert isinstance(ck.flash_attention_decode_is_available(), bool)
+
+
+@pytest.mark.parametrize(
+    ("capability", "has_kernel", "expected"),
+    [
+        ((7, 5), True, False),
+        ((8, 0), True, True),
+        ((9, 0), True, True),
+        ((9, 0), False, False),
+    ],
+)
+def test_flash_attention_decode_availability_checks_capability_and_kernel(
+    monkeypatch, capability, has_kernel, expected
+):
+    if getattr(torch.version, "hip", None):
+        pytest.skip("flash_attention_decode is CUDA-only")
+
+    class Extension:
+        pass
+
+    extension = Extension()
+    if has_kernel:
+        extension.flash_attention_decode = object()
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
+    monkeypatch.setattr(flash_attention_module._cuda_backend, "_EXT_AVAILABLE", True)
+    monkeypatch.setattr(flash_attention_module._cuda_backend, "_C", extension)
+
+    assert flash_attention_module.is_available() is expected
 
 
 @requires_flash_decode
