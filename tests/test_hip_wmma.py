@@ -1739,6 +1739,24 @@ def test_stochastic_rounding_fp8_edge_values_match_eager(dtype):
     assert torch.isnan(q.float()[~finite]).all()
 
 
+@pytest.mark.parametrize("out_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("numel", [15, 16, 17, 1 << 20])
+def test_stochastic_rounding_fp8_vector_and_scalar_paths_agree(hip, dtype, numel, out_dtype):
+    """An offset view runs the scalar fallback, which must give the same bits as
+    the vectorized path. The sizes straddle kVecElems to cover the chunk tail, and
+    the two fp8 formats take different constants through the rounding."""
+    torch.manual_seed(numel)
+    x = torch.randn(numel, device=DEV, dtype=dtype) * 10
+    rng = torch.randint(0, 256, (numel,), dtype=torch.uint8, device=DEV)
+
+    aligned = hip.stochastic_rounding_fp8(x.clone(), rng.clone(), out_dtype)
+    offset = hip.stochastic_rounding_fp8(_offset_copy(x), _offset_copy(rng), out_dtype)
+
+    assert x.data_ptr() % 16 == 0 and rng.data_ptr() % 16 == 0
+    assert torch.equal(aligned.view(torch.uint8), offset.view(torch.uint8))
+
+
 # A zero-length dimension makes the grid zero-dimensional, which HIP rejects with
 # hipErrorInvalidConfiguration rather than treating as a no-op.
 @needs_wmma

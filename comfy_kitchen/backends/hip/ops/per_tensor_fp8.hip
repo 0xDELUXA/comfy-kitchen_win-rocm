@@ -16,17 +16,6 @@ namespace comfy::hip_backend {
 
 constexpr int kThreads = 256;
 
-// Elements per thread on the vectorized path: enough for a lane to move a whole
-// 16-byte fp8 chunk, so a wave writes 512 contiguous bytes rather than 32.
-constexpr int kVecElems = 16;
-
-// Register staging for one thread's run. The alignment is what lets the accesses
-// widen to dwordx4.
-template <typename T>
-struct alignas(16) VecChunk {
-    T v[kVecElems];
-};
-
 template<typename T>
 __forceinline__ __device__ T from_float_as(float value) {
     return static_cast<T>(value);
@@ -134,12 +123,6 @@ __global__ void dequantize_per_tensor_fp8_vec_kernel(
             store_value<OutputType>(output, i, unpack_fp8(input[i], input_dtype_code) * s);
         }
     }
-}
-
-// Gates the vectorized path: a contiguous tensor can still be a mid-buffer view,
-// whose base carries the offset and is not 16-byte aligned.
-__forceinline__ static bool vec_aligned(const void* p) {
-    return (reinterpret_cast<uintptr_t>(p) & 15u) == 0;
 }
 
 } // namespace comfy::hip_backend
