@@ -49,8 +49,8 @@ void launch_convrot_w4a4_gemm_kernel(const void*, const void*, void*, const void
                                      const void*, int, int, int, int, int, hipStream_t);
 
 void launch_quantize_int8_rowwise_kernel(const void*, int, void*, void*, int, int, hipStream_t);
-void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, int, int, int, int,
-                                         hipStream_t);
+void launch_quantize_int8_convrot_kernel(const void*, int, void*, void*, void*, void*, int, int,
+                                         int, int, hipStream_t);
 void launch_quantize_int8_tensorwise_kernel(const void*, int, void*, void*, void*, int64_t,
                                             hipStream_t);
 void launch_dequantize_int8_simple_kernel(const void*, const void*, void*, int64_t, int64_t, int,
@@ -60,6 +60,7 @@ void launch_dequantize_int8_convrot_weight_kernel(const void*, const void*, void
 void launch_convrot_quant_int4_kernel(const void*, int, void*, void*, int, int, int, hipStream_t);
 void launch_unpack_int4_kernel(const void*, void*, int64_t, hipStream_t);
 int convrot_max_k_host(int);
+int convrot_int8_needs_spill_host(int, int, int);
 
 void launch_quantize_w4a8_convrot_kernel(const void*, const void*, void*, void*, void*, int64_t,
                                          int64_t, int, bool, uint64_t, hipStream_t);
@@ -402,7 +403,8 @@ void quantize_int8_rowwise(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
 }
 
 // act_code folds an elementwise activation into the rotation's load.
-void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales, int M, int K,
+void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scales,
+                           OptArray spill_rotated, OptArray spill_partials, int M, int K,
                            int group_size, int act_code, uintptr_t stream_ptr) {
     constexpr const char* kFn = "quantize_int8_convrot";
     require_nonneg(M, kFn, "M");
@@ -416,8 +418,25 @@ void quantize_int8_convrot(nb::ndarray<> x, nb::ndarray<> q, nb::ndarray<> scale
     require_len(q, static_cast<int64_t>(M) * K, kFn, "q");
     require_scale_len(scales, static_cast<size_t>(M), kFn, "scales");
 
+    void* spill_rotated_ptr = nullptr;
+    void* spill_partials_ptr = nullptr;
+    if (spill_rotated.has_value()) {
+        require_dtype(*spill_rotated, 0, 2, kFn, "spill_rotated");
+        require_len(*spill_rotated, static_cast<int64_t>(M) * K, kFn, "spill_rotated");
+        if (map_dtype_to_code(spill_rotated->dtype()) != map_dtype_to_code(x.dtype())) {
+            throw std::runtime_error(std::string(kFn) + ": spill_rotated dtype must match x");
+        }
+        spill_rotated_ptr = spill_rotated->data();
+    }
+    if (spill_partials.has_value()) {
+        require_dtype(*spill_partials, 0, 0, kFn, "spill_partials");
+        require_len(*spill_partials, static_cast<int64_t>(M) * (K / 256), kFn, "spill_partials");
+        spill_partials_ptr = spill_partials->data();
+    }
+
     launch_quantize_int8_convrot_kernel(x.data(), map_dtype_to_code(x.dtype()), q.data(),
-                                        scales.data(), M, K, group_size, act_code,
+                                        scales.data(), spill_rotated_ptr, spill_partials_ptr, M, K,
+                                        group_size, act_code,
                                         reinterpret_cast<hipStream_t>(stream_ptr));
     check_hip_launch();
 }
@@ -1490,6 +1509,8 @@ NB_MODULE(_C, m) {
     m.def("dequantize_int8_convrot_weight", &dequantize_int8_convrot_weight);
     m.def("convrot_quant_int4", &convrot_quant_int4);
     m.def("convrot_max_k", &convrot_max_k_host);
+    m.def("convrot_int8_needs_spill", &convrot_int8_needs_spill_host, nb::arg("m"),
+          nb::arg("k"), nb::arg("in_code"));
     m.def("unpack_int4", &unpack_int4);
     m.def("dequant_int4_grouped_to_int8", &dequant_int4_grouped_to_int8);
     m.def("quantize_w4a8_convrot", &quantize_w4a8_convrot);
