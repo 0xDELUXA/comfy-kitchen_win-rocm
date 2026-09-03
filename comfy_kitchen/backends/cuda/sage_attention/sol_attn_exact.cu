@@ -57,6 +57,7 @@ constexpr int NSTAGE = 2;      // pipeline depth; occupancy beats depth here
 #define SOL_EXACT_BOUNDS __launch_bounds__(NTHREADS)
 #endif
 
+template <typename TOut>
 __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     const int8_t* __restrict__ qi, const float* __restrict__ qs,
     const int8_t* __restrict__ kiP, const float2* __restrict__ ksb,
@@ -64,7 +65,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
     const uint16_t* __restrict__ blk_idx, const int32_t* __restrict__ blk_cnt,
     const __nv_bfloat16* __restrict__ o_part, const float* __restrict__ m_part,
     const float* __restrict__ l_part,
-    __nv_bfloat16* __restrict__ out,
+    TOut* __restrict__ out,
     int T, int Tp, int H, int NTB, float scale_log2)
 {
 #if SOL_SM80
@@ -109,7 +110,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
 
     // resume route's state: one (o, m, l) per (b, h, query block)
     float o_acc[NT][4];
-    float m_r[2], l_r[2];
+    float m_r[2], l_r[2], c_r[2];   // c_r: scale o_acc / l_r are carried in
     {
         const int64_t qb_s = (int64_t)bh * gridDim.x + q_block;
         const __nv_bfloat16* orow = o_part + qb_s * HD;
@@ -122,6 +123,7 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
             o_acc[nt][1] = v1; o_acc[nt][3] = v1;
         }
         m_r[0] = m_r[1] = m_part[qb_s];
+        c_r[0] = c_r[1] = m_part[qb_s];
         l_r[0] = l_r[1] = l_part[qb_s];
     }
 
@@ -177,7 +179,9 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         }
 
         float p_val[NKT][4];
-        float m_new[2] = {m_r[0], m_r[1]};
+        // P is quantized against the block max (floored 2^-20 under the running
+        // max) so every block gets the full u8 range
+        float bmax[2] = {m_r[0] - 20.f, m_r[1] - 20.f};
         #pragma unroll
         for (int nt = 0; nt < NKT; ++nt) {
             const int c0 = nt * 8 + qd * 2;
@@ -190,20 +194,22 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
                 const float s = (e & 1) ? fmaf((float)s_acc[nt][e], qsc[row] * k1s, m1)
                                         : fmaf((float)s_acc[nt][e], qsc[row] * k0s, m0);
                 p_val[nt][e] = s;
-                m_new[row] = fmaxf(m_new[row], s);
+                bmax[row] = fmaxf(bmax[row], s);
             }
         }
         #pragma unroll
         for (int off = 1; off <= 2; off <<= 1) {
-            m_new[0] = fmaxf(m_new[0], __shfl_xor_sync(0xffffffffu, m_new[0], off));
-            m_new[1] = fmaxf(m_new[1], __shfl_xor_sync(0xffffffffu, m_new[1], off));
+            bmax[0] = fmaxf(bmax[0], __shfl_xor_sync(0xffffffffu, bmax[0], off));
+            bmax[1] = fmaxf(bmax[1], __shfl_xor_sync(0xffffffffu, bmax[1], off));
         }
-        const float alpha0 = exp2f(m_r[0] - m_new[0]);
-        const float alpha1 = exp2f(m_r[1] - m_new[1]);
-        m_r[0] = m_new[0]; m_r[1] = m_new[1];
+        const float alpha0 = exp2f(c_r[0] - bmax[0]);
+        const float alpha1 = exp2f(c_r[1] - bmax[1]);
+        c_r[0] = bmax[0]; c_r[1] = bmax[1];
+        m_r[0] = fmaxf(m_r[0], bmax[0]);
+        m_r[1] = fmaxf(m_r[1], bmax[1]);
 
         // u8 P scale folded into the exponent (+log2 255); l carries it too
-        const float m_off[2] = {m_new[0] - 7.99435344f, m_new[1] - 7.99435344f};
+        const float m_off[2] = {bmax[0] - 7.99435344f, bmax[1] - 7.99435344f};
         #pragma unroll
         for (int nt = 0; nt < NKT; ++nt) {
             #pragma unroll
@@ -273,12 +279,12 @@ __global__ void SOL_EXACT_BOUNDS sol_exact_kernel(
         const int r = q_row0 + rr * 8;
         if (r >= T) continue;
         const float inv = rr ? inv1 : inv0;
-        __nv_bfloat16* orow = out + bh_base + (int64_t)r * H * HD;
+        TOut* orow = out + bh_base + (int64_t)r * H * HD;
         #pragma unroll
         for (int nt = 0; nt < NT; ++nt) {
             const int c = nt * 8 + qd * 2;
-            orow[c]     = __float2bfloat16(o_acc[nt][rr * 2]     * inv * vsc[vsc_base + c]);
-            orow[c + 1] = __float2bfloat16(o_acc[nt][rr * 2 + 1] * inv * vsc[vsc_base + c + 1]);
+            orow[c]     = from_f32<TOut>(o_acc[nt][rr * 2]     * inv * vsc[vsc_base + c]);
+            orow[c + 1] = from_f32<TOut>(o_acc[nt][rr * 2 + 1] * inv * vsc[vsc_base + c + 1]);
         }
     }
 #endif  // SOL_SM80
@@ -292,14 +298,18 @@ void launch_sol_exact(
     const void* blk_idx, const void* blk_cnt,
     const void* o_part, const void* m_part, const void* l_part, void* out,
     int B, int T, int Tp, int H, int NQ, int NTB,
-    float scale_log2, cudaStream_t stream)
+    float scale_log2, int elem, cudaStream_t stream)
 {
     dim3 grid(NQ, B * H);
-    sol_exact_kernel<<<grid, NTHREADS, 0, stream>>>(
-        (const int8_t*)qi, (const float*)qs, (const int8_t*)kiP, (const float2*)ksb,
-        (const int8_t*)vTi, (const float*)vsc,
-        (const uint16_t*)blk_idx, (const int32_t*)blk_cnt,
-        (const __nv_bfloat16*)o_part, (const float*)m_part, (const float*)l_part,
-        (__nv_bfloat16*)out, T, Tp, H, NTB, scale_log2);
+#define SOLX_LAUNCH(TOut)                                                              \
+    sol_exact_kernel<TOut><<<grid, NTHREADS, 0, stream>>>(                             \
+        (const int8_t*)qi, (const float*)qs, (const int8_t*)kiP, (const float2*)ksb,   \
+        (const int8_t*)vTi, (const float*)vsc,                                         \
+        (const uint16_t*)blk_idx, (const int32_t*)blk_cnt,                             \
+        (const __nv_bfloat16*)o_part, (const float*)m_part, (const float*)l_part,     \
+        (TOut*)out, T, Tp, H, NTB, scale_log2)
+    if (elem == sol::SOL_FP16) SOLX_LAUNCH(__half);
+    else SOLX_LAUNCH(__nv_bfloat16);
+#undef SOLX_LAUNCH
 }
 

@@ -5,6 +5,7 @@ from .backends import cuda as _cuda_backend  # noqa: F401
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
 from .backends import triton as _triton_backend  # noqa: F401
+from .backends.cuda import sol_attn_chunked  # chunked-producer form of sol_attn (HIP's below)
 from .backends.eager.quantization import DTYPE_TO_CODE
 from .backends.eager.quantization import mm_int8 as _mm_int8
 from .exceptions import (
@@ -39,12 +40,13 @@ from .tensor.w4a8_int8 import (
 # ROCm PyTorch build so CUDA/CPU processes do not pay the import cost or acquire
 # an unrelated GPU runtime merely because a combined wheel contains the module.
 if getattr(torch.version, "hip", None):
-    from .backends import hip as _hip_backend  # noqa: F401
+    from .backends import hip as _hip_backend
 
     # The HIP backend registers only on a supported AMD device (RDNA2/3/3.5/4),
     # and advertises only the ops that device can run; prefer it where it registers.
     if registry.is_available("hip"):
         registry.set_priority(["hip", "cuda", "triton", "eager"])
+        sol_attn_chunked = _hip_backend.sol_attn_chunked
 else:
     registry.mark_unavailable("hip", "PyTorch ROCm/HIP runtime not available")
 
@@ -63,6 +65,7 @@ __all__ = [
     "na2d",
     "na3d",
     "sol_attn",
+    "sol_attn_chunked",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -149,8 +152,8 @@ def sol_attn(
     below roughly 12k tokens dense or a fused attention is usually faster.
 
     Args:
-        q, k, v: ``(B, T, H, 128)`` tensors, same shape and dtype. The CUDA
-            backend requires bfloat16; head_dim is fixed at 128.
+        q, k, v: ``(B, T, H, 128)`` tensors, same shape and dtype. The fused
+            backends take bfloat16 or float16; head_dim is fixed at 128.
         tau: Routing threshold in sigmas of the proxy row. Higher routes fewer
             blocks exactly: cheaper and less accurate.
         scale: Score scale; None means ``head_dim ** -0.5``.
