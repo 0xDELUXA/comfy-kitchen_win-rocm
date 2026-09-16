@@ -84,6 +84,9 @@ __all__ = [
     "int8_attention_is_available",
     "flash_attention_decode_is_available",
     "flash_decode",
+    "gated_delta_decode_fused",
+    "gated_delta_decode_is_available",
+    "deltanet_conv_step",
     "is_available",
     "sage_int8_attend",
     "sage_int8_quantize",
@@ -891,6 +894,10 @@ _W4A8_MIN_CHUNK_COLS = 1024
 # what this path did before chunking, so a part that crosses over later loses only
 # the extra win rather than regressing.
 _W4A8_CHUNK_MAX_ROWS = _tuning_env_int("COMFY_KITCHEN_W4A8_CHUNK_MAX_ROWS", 64)
+# Matches kW4a8GemvMaxM in ops/w4a8_gemv.hip: past it the weight pass is amortized
+# over enough rows that the WMMA GEMM wins, and the kernel holds one accumulator
+# per row in registers.
+_W4A8_GEMV_MAX_ROWS = 8
 _W4A8_FALLBACK_L2_BYTES = 4 << 20
 _w4a8_l2_bytes: dict[int, int] = {}
 
@@ -951,10 +958,34 @@ def _w4a8_int8_linear_chunked(
 
     qdata_arg = _operand(qdata, device, "qdata")
     xs_arg = xs.reshape(-1).contiguous()
+    out = torch.empty((m, n), dtype=out_dtype, device=device)
+
+    # Decode fast path: the GEMV dequantizes in registers, so the INT8 weight never
+    # reaches memory. Bit-exact with the chunked path below, and it declines any
+    # shape it cannot take rather than the caller having to predict the envelope.
+    if m <= _W4A8_GEMV_MAX_ROWS and s_rel.dtype == torch.float8_e4m3fn:
+        used = _C.w4a8_codebook_gemv(
+            _dl(xq),
+            _dl(qdata_arg),
+            _dl(s_rel_arg),
+            None if codebook_arg is None else _dl(codebook_arg),
+            _dl(s_channel_arg),
+            _dl(xs_arg),
+            None if bias_arg is None else _dl(bias_arg),
+            _dl(out),
+            m,
+            n,
+            k,
+            group_size,
+            DTYPE_TO_CODE[out_dtype],
+            _stream(x),
+        )
+        if used:
+            return out.reshape(*orig_shape[:-1], n)
+
     # An empty weight has no chunk to size; the loop then has nothing to walk.
     chunk_cols = max(1, _w4a8_chunk_cols(m, n, k, device))
     workspace = torch.empty((chunk_cols, k), dtype=torch.int8, device=device)
-    out = torch.empty((m, n), dtype=out_dtype, device=device)
     _C.w4a8_int8_gemm_chunked(
         _dl(xq),
         _dl(qdata_arg),
@@ -1128,7 +1159,9 @@ def w4a8_int8_linear(
 
     The weight is decoded a column chunk at a time so a chunk is still cached when
     the GEMM reads it back, instead of the whole [N, K] INT8 weight round-tripping
-    through global memory.
+    through global memory. At decode row counts even that is more traffic than the
+    packed weight itself, so a few rows take a GEMV that dequantizes in registers
+    and never writes the INT8 weight at all.
     """
     validate_w4a8_operands(
         qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize
@@ -2732,6 +2765,117 @@ def flash_attention_decode_is_available() -> bool:
     which is otherwise an AttributeError at dispatch.
     """
     return has_wmma() and hasattr(_C, "flash_attention_decode")
+
+
+# ---------------------------------------------------------------------------
+# GatedDeltaNet decode
+#
+# The public entry points live in comfy_kitchen/gated_delta.py, which owns the
+# reshaping; everything below is the raw launch. See ops/gated_delta.hip for why
+# the recurrent state lives in registers here rather than in LDS.
+# ---------------------------------------------------------------------------
+
+# Matches kDeltaMaxSteps, kDeltaKeyDim and kDeltaConvMaxWindow in
+# ops/gated_delta.hip.
+_DELTA_MAX_STEPS = 8
+_DELTA_KEY_DIM = 128
+_DELTA_CONV_MAX_WINDOW = 16
+
+
+def gated_delta_decode_is_available(key_head_dim: int = 128, value_head_dim: int = 128) -> bool:
+    """Whether the fused DeltaNet decode kernels can run here for these head dims.
+
+    The kernels use no matrix cores, but they do use bf16 and fp16 arithmetic
+    throughout, so they draw the line where has_wmma() does, as the decode
+    attention kernel next door does.
+    """
+    if not has_wmma() or not hasattr(_C, "gated_delta_decode_fused"):
+        return False
+    if key_head_dim != _DELTA_KEY_DIM or value_head_dim <= 0 or value_head_dim > 512:
+        return False
+    # One wave covers 32 value columns; a partial wave would leave the partition
+    # reduction reading columns nobody wrote.
+    return value_head_dim % 32 == 0
+
+
+def gated_delta_decode_fused(
+    mixed_qkv: torch.Tensor,
+    x: torch.Tensor,
+    w_a: torch.Tensor,
+    w_b: torch.Tensor,
+    dt_bias: torch.Tensor,
+    g_decay: torch.Tensor,
+    state: torch.Tensor,
+    out: torch.Tensor,
+    snapshots: torch.Tensor | None,
+    z: torch.Tensor,
+    norm_w: torch.Tensor,
+    eps: float,
+    key_dim: int,
+    num_key_heads: int,
+    scale: float,
+) -> bool:
+    """S decode steps into ``out``; ``state`` is updated in place.
+
+    Returns False when the shape is outside the kernel's envelope, leaving both
+    outputs untouched, so the caller can fall back rather than predict it.
+    """
+    batch, channels, seq = mixed_qkv.shape
+    heads, key_head_dim, value_head_dim = state.shape[1], state.shape[2], state.shape[3]
+    return _C.gated_delta_decode_fused(
+        _dl(mixed_qkv),
+        _dl(x),
+        _dl(w_a),
+        _dl(w_b),
+        _dl(dt_bias),
+        _dl(g_decay),
+        _dl(state),
+        _dl(out),
+        None if snapshots is None else _dl(snapshots),
+        _dl(z),
+        _dl(norm_w),
+        float(eps),
+        batch,
+        heads,
+        num_key_heads,
+        seq,
+        key_head_dim,
+        value_head_dim,
+        channels,
+        x.shape[2],
+        key_dim,
+        float(scale),
+        _stream(mixed_qkv),
+    )
+
+
+def deltanet_conv_step(
+    proj: torch.Tensor,
+    conv_state: torch.Tensor,
+    conv_w: torch.Tensor,
+    conv_b: torch.Tensor | None,
+    conv_out: torch.Tensor,
+    snapshots: torch.Tensor | None,
+) -> bool:
+    """Depthwise causal conv step with silu into ``conv_out``.
+
+    ``conv_state`` is updated in place. Returns False for a shape outside the
+    kernel's envelope, leaving both outputs untouched.
+    """
+    batch, seq, channels = proj.shape
+    return _C.deltanet_conv_step(
+        _dl(proj),
+        _dl(conv_state),
+        _dl(conv_w),
+        None if conv_b is None else _dl(conv_b),
+        _dl(conv_out),
+        None if snapshots is None else _dl(snapshots),
+        batch,
+        channels,
+        seq,
+        conv_w.shape[-1],
+        _stream(proj),
+    )
 
 
 def flash_decode(
