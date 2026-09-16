@@ -983,6 +983,85 @@ def test_w4a8_linear_chunking_does_not_change_the_result(hip, monkeypatch, n, ch
     assert torch.equal(chunked, one_pass)
 
 
+@pytest.mark.parametrize(("m", "n", "k", "group_size"),
+                         [(1, 256, 512, 16), (3, 768, 1024, 16), (8, 512, 2048, 32),
+                          (2, 384, 2048, 128), (1, 512, 1104, 16)])
+@pytest.mark.parametrize("bias", [False, True])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16, torch.float32])
+@needs_wmma
+def test_w4a8_decode_gemv_matches_the_chunked_path(hip, monkeypatch, m, n, k, group_size, bias,
+                                                   out_dtype):
+    """The GEMV decodes the weight in registers instead of through the INT8
+    workspace, but lands on the same int8 grid and runs the same epilogue, so the
+    two paths have to agree bit for bit rather than merely closely.
+
+    K=1104 leaves a half-row that is not 16-byte aligned, which is the only case
+    that reaches the GEMV's one-vector-per-lane loop."""
+    torch.manual_seed(0)
+    convrot = 256 if k % 256 == 0 else 16
+    _, (qdata, s_rel, s_channel, _, cb) = _quantize_w4a8(
+        n, k, group_size=group_size, convrot_groupsize=convrot
+    )
+    x = torch.randn(m, k, device=DEV, dtype=torch.bfloat16)
+    bias_t = torch.randn(n, device=DEV, dtype=out_dtype) if bias else None
+    kwargs = {
+        "codebook": cb,
+        "bias": bias_t,
+        "group_size": group_size,
+        "convrot_groupsize": convrot,
+        "out_dtype": out_dtype,
+    }
+
+    # A launcher that declined would leave both calls on the chunked path, where
+    # the comparison below passes without the GEMV having run at all.
+    taken = []
+    launch = hip._C.w4a8_codebook_gemv
+
+    def record(*args):
+        taken.append(launch(*args))
+        return taken[-1]
+
+    monkeypatch.setattr(hip._C, "w4a8_codebook_gemv", record)
+
+    got = hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, **kwargs)
+    assert taken == [True]
+    monkeypatch.setattr(hip, "_W4A8_GEMV_MAX_ROWS", 0)
+    chunked = hip.w4a8_int8_linear(x, qdata, s_rel, s_channel, **kwargs)
+
+    assert got.shape == (m, n)
+    assert torch.equal(got, chunked)
+
+
+@needs_wmma
+def test_w4a8_decode_gemv_declines_what_it_cannot_take(hip):
+    """The launcher answers for its own envelope so the caller never has to predict
+    it, and a decline has to leave the output alone rather than half-write it."""
+    n, k = 256, 512
+    torch.manual_seed(0)
+
+    def call(m, group_size):
+        _, (qdata, s_rel, s_channel, _, cb) = _quantize_w4a8(n, k, group_size=group_size)
+        cb_arg = cb.to(device=DEV, dtype=torch.float32).reshape(-1).contiguous()
+        s_channel_arg = s_channel.to(device=DEV, dtype=torch.float32).reshape(-1).contiguous()
+        xq = torch.zeros(m, k, device=DEV, dtype=torch.int8)
+        xs = torch.ones(m, device=DEV, dtype=torch.float32)
+        out = torch.full((m, n), float("nan"), device=DEV, dtype=torch.bfloat16)
+        used = hip._C.w4a8_codebook_gemv(
+            hip._dl(xq), hip._dl(qdata), hip._dl(s_rel.view(torch.uint8)), hip._dl(cb_arg),
+            hip._dl(s_channel_arg), hip._dl(xs), None, hip._dl(out),
+            m, n, k, group_size, hip.DTYPE_TO_CODE[torch.bfloat16], 0,
+        )
+        return used, out
+
+    used, out = call(hip._W4A8_GEMV_MAX_ROWS, 16)
+    assert used and not out.isnan().any()
+    # One row past the accumulator array, and a group finer than one 16-column vector.
+    for m, group_size in ((hip._W4A8_GEMV_MAX_ROWS + 1, 16), (1, 8)):
+        used, out = call(m, group_size)
+        assert not used
+        assert out.isnan().all()
+
+
 def test_w4a8_chunk_cols_stays_within_its_bounds(hip):
     n, k, dev = 12288, 3072, torch.device(DEV, torch.cuda.current_device())
     cols = hip._w4a8_chunk_cols(1, n, k, dev)
@@ -2797,3 +2876,139 @@ def test_na3d_launcher_rejects_a_mismatched_operand(hip):
     with pytest.raises(RuntimeError, match="float16 or bfloat16"):
         hip._C.na3d(hip._dl(q.float()), hip._dl(q), hip._dl(q), hip._dl(out),
                     *extents, hip.DTYPE_TO_CODE[torch.float32], stream)
+
+
+# ---------------------------------------------------------------------------
+# GatedDeltaNet decode
+#
+# tests/test_gated_delta_fused.py covers the shape the CUDA backend is built for
+# and runs here unchanged. What it cannot cover is the part of the HIP kernel that
+# is not a transcription: the recurrent state is [DK, DV] fp32, 64 KiB at DK = DV
+# = 128, which is the whole RDNA per-workgroup LDS budget, so it lives in
+# registers split R ways across the DK axis. R changes with DV, and each R is a
+# separate instantiation with its own partition reduction.
+# ---------------------------------------------------------------------------
+
+needs_gated_delta = pytest.mark.skipif(
+    not ck.gated_delta_decode_is_available(), reason="fused DeltaNet decode kernels unavailable"
+)
+
+
+def _gated_delta_reference(conv_out, x, w_a, w_b, dt_bias, g_decay, state, z, norm_w,
+                           heads, key_heads, key_dim_head, value_dim, scale, eps):
+    from torch.nn import functional
+
+    batch, seq = x.shape[0], x.shape[1]
+    key_dim = key_heads * key_dim_head
+    a = functional.linear(x, w_a)
+    b = functional.linear(x, w_b)
+    beta = b.sigmoid().reshape(batch, seq, heads)
+    g = (g_decay * functional.softplus(a.float() + dt_bias)).reshape(batch, seq, heads).exp()
+    query, key, value = conv_out.transpose(1, 2).split(
+        [key_dim, key_dim, heads * value_dim], dim=-1
+    )
+    repeats = heads // key_heads
+    q = functional.normalize(
+        query.reshape(batch, seq, key_heads, key_dim_head).float(), dim=-1
+    ).repeat_interleave(repeats, dim=2) * scale
+    k = functional.normalize(
+        key.reshape(batch, seq, key_heads, key_dim_head).float(), dim=-1
+    ).repeat_interleave(repeats, dim=2)
+    v = value.reshape(batch, seq, heads, value_dim).float()
+    outs, snaps = [], []
+    for s in range(seq):
+        state.mul_(g[:, s, :, None, None])
+        kv_mem = torch.einsum("bhk,bhkv->bhv", k[:, s], state)
+        delta = (v[:, s] - kv_mem) * beta[:, s, :, None]
+        state.add_(torch.einsum("bhk,bhv->bhkv", k[:, s], delta))
+        outs.append(torch.einsum("bhk,bhkv->bhv", q[:, s], state))
+        if s < seq - 1:
+            snaps.append(state.clone())
+    out = torch.stack(outs, dim=1).to(x.dtype)
+    out = functional.rms_norm(out.reshape(-1, value_dim), (value_dim,), norm_w, eps)
+    out = out * functional.silu(z.reshape(-1, value_dim))
+    return out.reshape(batch, seq, heads, value_dim), (torch.stack(snaps) if snaps else None)
+
+
+@pytest.mark.parametrize("value_dim", [128, 256, 512])
+@pytest.mark.parametrize("key_heads", [1, 2, 4])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@needs_gated_delta
+def test_gated_delta_decode_across_key_slices(hip, value_dim, key_heads, dtype, seed):
+    """One instantiation per DK slice, and the slice is chosen from DV: 128 takes 8
+    threads per key column, 256 takes 4 and 512 takes 2. key_heads sweeps the GQA
+    fan-out, which is what decides which q/k row a value head reads."""
+    batch, heads, key_dim_head, hidden, seq = 2, 4, 128, 256, 4
+    if not ck.gated_delta_decode_is_available(
+        key_head_dim=key_dim_head, value_head_dim=value_dim
+    ):
+        pytest.skip(f"value_head_dim {value_dim} unsupported here")
+    key_dim = key_heads * key_dim_head
+    channels = 2 * key_dim + heads * value_dim
+    scale, eps = key_dim_head ** -0.5, 1e-6
+
+    conv_out = torch.randn(batch, channels, seq, device=DEV, dtype=dtype)
+    x = torch.randn(batch, seq, hidden, device=DEV, dtype=dtype)
+    w_a = torch.randn(heads, hidden, device=DEV, dtype=dtype) * 0.05
+    w_b = torch.randn(heads, hidden, device=DEV, dtype=dtype) * 0.05
+    dt_bias = torch.randn(heads, device=DEV)
+    g_decay = -torch.rand(heads, device=DEV) - 0.5
+    state = torch.randn(batch, heads, key_dim_head, value_dim, device=DEV) * 0.1
+    z = torch.randn(batch, seq, heads * value_dim, device=DEV, dtype=dtype)
+    norm_w = torch.rand(value_dim, device=DEV, dtype=dtype) + 0.5
+
+    ref_state = state.clone()
+    ref_out, ref_snaps = _gated_delta_reference(
+        conv_out, x, w_a, w_b, dt_bias, g_decay, ref_state, z, norm_w, heads, key_heads,
+        key_dim_head, value_dim, scale, eps,
+    )
+
+    got_state = state.clone()
+    snaps = torch.empty((seq - 1, batch, heads, key_dim_head, value_dim), device=DEV)
+    got = ck.gated_delta_decode_fused(
+        conv_out, x, w_a, w_b, dt_bias, g_decay, got_state, key_dim, key_heads, scale, z,
+        norm_w, eps, snaps,
+    )
+
+    # The DK reduction is split across threads and summed partition by partition,
+    # so it reassociates against the reference rather than matching it exactly.
+    tol = 1e-5 if dtype == torch.float32 else 6e-3
+    assert got.shape == (batch, seq, heads, value_dim)
+    assert _rel_err(got.float(), ref_out.float()) < tol
+    assert _rel_err(got_state, ref_state) < tol
+    assert _rel_err(snaps, ref_snaps) < tol
+
+
+@pytest.mark.parametrize("kernel_size", [2, 4, 8])
+@pytest.mark.parametrize("seq", [1, 5, 8])
+@needs_gated_delta
+def test_deltanet_conv_step_window_fits_registers(hip, kernel_size, seq, seed):
+    """The conv window is a private array, so the carried state plus this step's
+    tokens has to stay inside it; KS = 8 with seq = 8 is the widest that does."""
+    from torch.nn import functional
+
+    batch, channels, dtype = 2, 512, torch.bfloat16
+    proj = torch.randn(batch, seq, channels, device=DEV, dtype=dtype)
+    state = torch.randn(batch, channels, kernel_size - 1, device=DEV, dtype=dtype)
+    w = torch.randn(channels, 1, kernel_size, device=DEV, dtype=dtype) * 0.5
+    b = torch.randn(channels, device=DEV, dtype=dtype) * 0.1
+
+    combined = torch.cat([state, proj.transpose(1, 2)], dim=-1)
+    ref = functional.silu(functional.conv1d(combined, w, b, groups=channels))
+    ref_state = combined[:, :, seq:].contiguous()
+
+    got_state = state.clone()
+    snaps = (
+        torch.empty((seq - 1, batch, channels, kernel_size - 1), device=DEV, dtype=dtype)
+        if seq > 1
+        else None
+    )
+    got = ck.deltanet_conv_step(proj, got_state, w, b, snaps)
+
+    assert _rel_err(got, ref) < 1e-2
+    assert torch.equal(got_state, ref_state)
+    if seq > 1:
+        expected = torch.stack(
+            [combined[:, :, 1 + s: s + kernel_size] for s in range(seq - 1)]
+        )
+        assert torch.equal(snaps, expected)

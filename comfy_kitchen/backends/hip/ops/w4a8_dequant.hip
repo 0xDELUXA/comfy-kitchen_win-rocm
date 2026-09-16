@@ -6,8 +6,8 @@
 // per-channel scale stays for that GEMM's epilogue. Memory-bound.
 #include <stdexcept>
 
-#include "../fp8_utils.h"
 #include "../launchers.h"
+#include "../w4a8_codec.h"
 
 namespace comfy::hip_backend {
 
@@ -20,27 +20,6 @@ inline int64_t dtype_size(int code) {
         case 2: return 2;          // float16, bfloat16
         default: return 1;         // uint8 storage, which is how fp8 crosses
     }
-}
-
-// The group scale is stored as fp32 or as raw e4m3 bytes.
-template <typename ScaleT>
-__forceinline__ __device__ float load_group_scale(ScaleT v);
-
-template <>
-__forceinline__ __device__ float load_group_scale<float>(float v) {
-    return v;
-}
-
-template <>
-__forceinline__ __device__ float load_group_scale<uint8_t>(uint8_t v) {
-    return fp8_to_float(v);
-}
-
-__forceinline__ __device__ int8_t dequant_round(float v) {
-    // rintf is round-half-to-even, matching torch.round.
-    int q = static_cast<int>(rintf(v));
-    q = q < -127 ? -127 : (q > 127 ? 127 : q);
-    return static_cast<int8_t>(q);
 }
 
 // One thread reads 8 packed bytes and writes 16 int8. group_size is 4, 8, 16 or
@@ -71,7 +50,6 @@ __global__ void dequant_int4_grouped_to_int8_kernel(
     const int col_base = byte_base * 2;
 
     const uint2 packed = *reinterpret_cast<const uint2*>(&qw[row * k_half + byte_base]);
-    const unsigned words[2] = {packed.x, packed.y};
 
     const int64_t scale_row = row * (k / group_size);
     const int group_base = col_base / group_size;
@@ -85,25 +63,8 @@ __global__ void dequant_int4_grouped_to_int8_kernel(
         }
     }
 
-    alignas(16) int8_t decoded[16];
-#pragma unroll
-    for (int w = 0; w < 2; ++w) {
-#pragma unroll
-        for (int b = 0; b < 4; ++b) {
-            const int pair = w * 4 + b;
-            const int local = (group_size >= 16) ? 0 : ((pair * 2) / group_size);
-            const float s = (local == 0) ? sc0 : (local == 1 ? sc1 : (local == 2 ? sc2 : sc3));
-            const unsigned byte = (words[w] >> (b * 8)) & 0xFFu;
-            const unsigned lo = byte & 0xFu;
-            const unsigned hi = (byte >> 4) & 0xFu;
-            const float v0 = codebook ? cb[lo] : (static_cast<float>(lo) - 8.0f);
-            const float v1 = codebook ? cb[hi] : (static_cast<float>(hi) - 8.0f);
-            decoded[pair * 2] = dequant_round(v0 * s);
-            decoded[pair * 2 + 1] = dequant_round(v1 * s);
-        }
-    }
     *reinterpret_cast<uint4*>(&out[row * k + col_base]) =
-        *reinterpret_cast<const uint4*>(decoded);
+        dequant16_int4_to_int8(packed, codebook ? cb : nullptr, sc0, sc1, sc2, sc3, group_size);
 }
 
 }  // namespace comfy::hip_backend
