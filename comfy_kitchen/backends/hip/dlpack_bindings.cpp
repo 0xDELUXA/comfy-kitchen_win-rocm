@@ -1309,10 +1309,8 @@ static void sage_check_shapes(const nb::ndarray<>& q, const nb::ndarray<>& k,
     }
 }
 
-// sage_attend synthesizes Q/K/V/O strides from the extents rather than reading
-// them, so anything but the packed row-major layout is read as though it were
-// packed. The Python layer only ever allocates fresh contiguous buffers; a caller
-// reaching _C directly can pass a view.
+// Kernels that synthesize strides from extents instead of reading tensor strides
+// require packed row-major operands, including views passed directly to _C.
 static void require_packed_contiguous(const nb::ndarray<>& t, const char* fn, const char* name) {
     int64_t expected = 1;
     for (int axis = static_cast<int>(t.ndim()) - 1; axis >= 0; --axis) {
@@ -1999,10 +1997,23 @@ bool gated_delta_decode_fused(nb::ndarray<> mixed_qkv, nb::ndarray<> x, nb::ndar
     require_scale_len(dt_bias, static_cast<size_t>(Hv), kFn, "dt_bias");
     require_scale_len(g_decay, static_cast<size_t>(Hv), kFn, "g_decay");
     require_scale_len(state, static_cast<size_t>(B) * Hv * DK * DV, kFn, "state");
+    // Reject strided buffers before launch: copying mutable state or snapshots
+    // would lose the in-place update, and treating a view as packed corrupts it.
+    require_packed_contiguous(mixed_qkv, kFn, "mixed_qkv");
+    require_packed_contiguous(x, kFn, "x");
+    require_packed_contiguous(w_a, kFn, "w_a");
+    require_packed_contiguous(w_b, kFn, "w_b");
+    require_packed_contiguous(dt_bias, kFn, "dt_bias");
+    require_packed_contiguous(g_decay, kFn, "g_decay");
+    require_packed_contiguous(state, kFn, "state");
+    require_packed_contiguous(out, kFn, "out");
+    require_packed_contiguous(z, kFn, "z");
+    require_packed_contiguous(norm_w, kFn, "norm_w");
     void* snap_ptr = nullptr;
     if (snapshots.has_value() && S > 1) {
         require_scale_len(*snapshots, static_cast<size_t>(S - 1) * B * Hv * DK * DV, kFn,
                           "snapshots");
+        require_packed_contiguous(*snapshots, kFn, "snapshots");
         snap_ptr = snapshots->data();
     }
 
@@ -2036,15 +2047,21 @@ bool deltanet_conv_step(nb::ndarray<> proj, nb::ndarray<> conv_state, nb::ndarra
     require_len(conv_state, static_cast<int64_t>(B) * C * (KS - 1), kFn, "conv_state");
     require_len(conv_w, static_cast<int64_t>(C) * KS, kFn, "conv_w");
     require_len(conv_out, static_cast<int64_t>(B) * C * S, kFn, "conv_out");
+    require_packed_contiguous(proj, kFn, "proj");
+    require_packed_contiguous(conv_state, kFn, "conv_state");
+    require_packed_contiguous(conv_w, kFn, "conv_w");
+    require_packed_contiguous(conv_out, kFn, "conv_out");
     if (conv_b.has_value()) {
         require_same_dtype(*conv_b, dtype_code, kFn, "conv_b");
         require_len(*conv_b, C, kFn, "conv_b");
+        require_packed_contiguous(*conv_b, kFn, "conv_b");
     }
     void* snaps = nullptr;
     if (conv_snaps.has_value() && S > 1) {
         require_same_dtype(*conv_snaps, dtype_code, kFn, "conv_snaps");
         require_len(*conv_snaps, static_cast<int64_t>(S - 1) * B * C * (KS - 1), kFn,
                     "conv_snaps");
+        require_packed_contiguous(*conv_snaps, kFn, "conv_snaps");
         snaps = conv_snaps->data();
     }
 

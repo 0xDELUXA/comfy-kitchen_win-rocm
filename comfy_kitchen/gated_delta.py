@@ -72,7 +72,11 @@ def gated_delta_decode_fused(
     eps: float,
     snapshots: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """S GatedDeltaNet decode steps from the conv output [B, C, S]; state [B, Hv, DK, DV] fp32 updated in place."""
+    """S GatedDeltaNet decode steps from the conv output [B, C, S].
+
+    The fp32 state [B, Hv, DK, DV] is updated in place. State, dt_bias, g_decay,
+    and snapshots must be contiguous.
+    """
     batch, _, seq = mixed_qkv.shape
     heads, key_dim_head, value_dim = state.shape[1], state.shape[2], state.shape[3]
     if not is_available(x.device, key_dim_head, value_dim):
@@ -109,7 +113,11 @@ def deltanet_conv_step(
     conv_b: torch.Tensor | None = None,
     snapshots: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Depthwise causal conv + silu over proj [B, S, C]; conv_state [B, C, KS-1] updated in place, returns [B, C, S]."""
+    """Depthwise causal conv + silu over proj [B, S, C], returning [B, C, S].
+
+    The conv_state [B, C, KS-1] is updated in place. Conv_state and snapshots
+    must be contiguous.
+    """
     if not is_available(proj.device):
         raise RuntimeError("deltanet_conv_step requires the CUDA or HIP extension")
     batch, seq, channels = proj.shape
