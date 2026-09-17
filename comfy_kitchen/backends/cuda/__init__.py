@@ -1995,7 +1995,7 @@ def int8_linear(
         and 256 <= k_act <= _CONVROT_FUSED_MAX_K
         and _convrot_fused_shared_memory_fits(x_2d, k_act, convrot_groupsize)
     )
-    if input_act not in (None, "none") and not (_fused_convrot_ok and x_2d.shape[0] > 1):
+    if input_act not in (None, "none") and not _fused_convrot_ok:
         x_2d = _apply_input_act(x_2d, input_act, input_act_weight, input_act_eps)
         input_act = None
 
@@ -2032,7 +2032,7 @@ def int8_linear(
         and k % 4 == 0
         and (k <= 2560 or (k == 6144 and n <= 128))
     )
-    if convrot_m1_supported or nonconvrot_m1_supported:
+    if input_act in (None, "none") and (convrot_m1_supported or nonconvrot_m1_supported):
         x_qdata = torch.empty((1, k), dtype=torch.int8, device=x.device)
         x_scale = torch.empty((1, 1), dtype=torch.float32, device=x.device)
         weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
@@ -2096,9 +2096,12 @@ def int8_linear(
             stream_ptr,
         )
 
-    if m == 1 and k % 4 == 0:
+    if (m == 1 and k % 4 == 0) or (m == 2 and k % 16 == 0):
+        # The two-row kernel uses 16-byte loads, including for contiguous views.
+        if m == 2 and not _aligned16(weight):
+            weight = weight.clone()
         weight_scale = _int8_weight_scale_arg(weight_scale, x.device)
-        out = torch.empty((1, n), dtype=out_dtype, device=x.device)
+        out = torch.empty((m, n), dtype=out_dtype, device=x.device)
         bias_arg = bias if bias is not None else _empty_cuda_tensor(x.device, out_dtype)
         if bias is not None and (bias.device != x.device or bias.dtype != out_dtype or not bias.is_contiguous()):
             bias_arg = bias.to(device=x.device, dtype=out_dtype).contiguous()

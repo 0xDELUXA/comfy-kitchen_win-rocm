@@ -665,6 +665,48 @@ __global__ void int8_gemv_dequant_warp_kernel(
     }
 }
 
+template<int WARPS, typename OutputType, typename BiasType>
+__global__ void int8_gemv2_dequant_warp_kernel(
+    const int8_t* __restrict__ x,
+    const int8_t* __restrict__ w,
+    const float* __restrict__ x_scales,
+    const float* __restrict__ weight_scales,
+    const BiasType* __restrict__ bias,
+    OutputType* __restrict__ output,
+    int n,
+    int k,
+    int scale_size)
+{
+    const int lane = threadIdx.x % 32;
+    const int row = blockIdx.x * WARPS + threadIdx.x / 32;
+    if (row >= n) {
+        return;
+    }
+    const int4* xv0 = reinterpret_cast<const int4*>(x);
+    const int4* xv1 = reinterpret_cast<const int4*>(x + k);
+    const int4* wv = reinterpret_cast<const int4*>(w + static_cast<int64_t>(row) * k);
+    int a0 = 0, a1 = 0;
+    for (int i = lane; i < k / 16; i += 32) {
+        const int4 weights = wv[i], x0 = xv0[i], x1 = xv1[i];
+        a0 = __dp4a(x0.x, weights.x, a0);
+        a1 = __dp4a(x1.x, weights.x, a1);
+        a0 = __dp4a(x0.y, weights.y, a0);
+        a1 = __dp4a(x1.y, weights.y, a1);
+        a0 = __dp4a(x0.z, weights.z, a0);
+        a1 = __dp4a(x1.z, weights.z, a1);
+        a0 = __dp4a(x0.w, weights.w, a0);
+        a1 = __dp4a(x1.w, weights.w, a1);
+    }
+    a0 = warp_reduce_sum_i32(a0);
+    a1 = warp_reduce_sum_i32(a1);
+    if (lane == 0) {
+        const float scale = weight_scales[scale_size == 1 ? 0 : row];
+        const float b = bias ? to_float(bias[row]) : 0.0f;
+        output[row] = from_float<OutputType>(float(a0) * x_scales[0] * scale + b);
+        output[n + row] = from_float<OutputType>(float(a1) * x_scales[1] * scale + b);
+    }
+}
+
 template<typename OutputType>
 __global__ void dequantize_int8_simple_kernel(
     const int8_t* __restrict__ input,
@@ -1716,6 +1758,7 @@ void launch_int8_gemv_dequant_kernel(
     const void* weight_scales,
     const void* bias,
     void* output,
+    int64_t num_rows,
     int64_t num_cols,
     int64_t K,
     int64_t weight_scale_size,
@@ -1733,6 +1776,35 @@ void launch_int8_gemv_dequant_kernel(
     }
     if (weight_scale_size != 1 && weight_scale_size != num_cols) {
         throw std::runtime_error("INT8 GEMV weight scale must be scalar or per-output-channel");
+    }
+
+    if (num_rows == 2) {
+        if (K % 16 != 0) {
+            throw std::runtime_error("INT8 two-row GEMV requires K divisible by 16");
+        }
+        DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+            auto launch = [&](auto bias_ptr) {
+                using BiasType = std::remove_cv_t<std::remove_pointer_t<decltype(bias_ptr)>>;
+                constexpr int warps = 8;
+                comfy::int8_gemv2_dequant_warp_kernel<warps, OutputType, BiasType>
+                    <<<(num_cols + warps - 1) / warps, warps * 32, 0, stream>>>(
+                        static_cast<const int8_t*>(input), static_cast<const int8_t*>(weight),
+                        static_cast<const float*>(x_scales), static_cast<const float*>(weight_scales),
+                        bias_ptr, static_cast<OutputType*>(output), num_cols, K, weight_scale_size);
+            };
+            if (has_bias) {
+                DISPATCH_FP_DTYPE(bias_dtype_code, BiasType, [&] {
+                    launch(static_cast<const BiasType*>(bias));
+                });
+            } else {
+                launch(static_cast<const float*>(nullptr));
+            }
+        });
+        const cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            throw std::runtime_error(std::string("CUDA INT8 two-row GEMV failed: ") + cudaGetErrorString(err));
+        }
+        return;
     }
 
     DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {

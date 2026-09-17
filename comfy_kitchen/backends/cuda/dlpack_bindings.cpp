@@ -2175,6 +2175,7 @@ extern "C" {
         const void* weight_scales,
         const void* bias,
         void* output,
+        int64_t num_rows,
         int64_t num_cols,
         int64_t K,
         int64_t weight_scale_size,
@@ -3445,16 +3446,16 @@ void int8_gemv_dequant(
     const int64_t M = input.shape(0);
     const int64_t K = input.shape(1);
     const int64_t N = weight.shape(0);
-    if (M != 1) {
-        throw std::runtime_error("INT8 GEMV dequant expects M == 1");
+    if (M != 1 && M != 2) {
+        throw std::runtime_error("INT8 GEMV dequant expects M == 1 or M == 2");
     }
     if (weight.shape(1) != K) {
         throw std::runtime_error("INT8 GEMV weight K mismatch");
     }
-    if (x_scales.shape(0) != 1 || x_scales.shape(1) != 1) {
+    if (x_scales.shape(0) != M || x_scales.shape(1) != 1) {
         throw std::runtime_error("INT8 GEMV activation scale shape mismatch");
     }
-    if (output.shape(0) != 1 || output.shape(1) != N) {
+    if (output.shape(0) != M || output.shape(1) != N) {
         throw std::runtime_error("INT8 GEMV output shape mismatch");
     }
     if (output_dtype_code < 0 || output_dtype_code > 2) {
@@ -3481,6 +3482,7 @@ void int8_gemv_dequant(
         weight_scales.data(),
         has_bias ? bias.data() : nullptr,
         output.data(),
+        M,
         N,
         K,
         static_cast<int64_t>(weight_scales.size()),
@@ -3580,6 +3582,7 @@ void int8_linear_m1(
         weight_scales.data(),
         has_bias ? bias.data() : nullptr,
         output.data(),
+        M,
         N,
         K,
         static_cast<int64_t>(weight_scales.size()),
