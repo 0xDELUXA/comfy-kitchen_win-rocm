@@ -53,9 +53,6 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
-from comfy_kitchen.backends.eager.w4a8_int8 import (
-    _dequant_int4_grouped_to_int8 as _eager_dequant_grouped_to_int8,
-)
 
 logger = logging.getLogger("comfy_kitchen.hip")
 
@@ -837,10 +834,8 @@ def _dequant_int4_grouped_to_int8(
     codebook: torch.Tensor | None,
     group_size: int,
 ) -> torch.Tensor:
-    """Decode packed INT4 weights to the grouped INT8 grid the GEMM consumes."""
-    n, k, bits = _w4a8_geometry(qdata, s_rel, group_size)
-    if bits != 4:  # the HIP decode kernels are 4-bit only; eager is bit-exact with them
-        return _eager_dequant_grouped_to_int8(qdata, s_rel, codebook, group_size)
+    """Decode packed INT4/INT6 weights to the grouped INT8 grid the GEMM consumes."""
+    n, k, _bits = _w4a8_geometry(qdata, s_rel, group_size)
     device = qdata.device
     qdata_arg = _operand(qdata, device, "qdata")
     scale_code = DTYPE_TO_CODE[s_rel.dtype]
@@ -939,7 +934,7 @@ def _w4a8_int8_linear_chunked(
     convrot_groupsize: int,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    n, k, _bits = _w4a8_geometry(qdata, s_rel, group_size)  # caller routes non-4-bit away
+    n, k, _bits = _w4a8_geometry(qdata, s_rel, group_size)
     device = x.device
     orig_shape = x.shape
     x2d = x.reshape(-1, k).contiguous()
@@ -1164,7 +1159,7 @@ def w4a8_int8_linear(
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """``x @ W.T + bias`` via the HIP INT4 decode feeding the WMMA INT8 GEMM.
+    """``x @ W.T + bias`` via the HIP INT4/INT6 decode feeding the WMMA INT8 GEMM.
 
     The weight is decoded a column chunk at a time so a chunk is still cached when
     the GEMM reads it back, instead of the whole [N, K] INT8 weight round-tripping
@@ -1172,7 +1167,7 @@ def w4a8_int8_linear(
     packed weight itself, so a few rows take a GEMV that dequantizes in registers
     and never writes the INT8 weight at all.
     """
-    _n, k, bits = validate_w4a8_operands(
+    _n, k, _bits = validate_w4a8_operands(
         qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize
     )
     if x.shape[-1] != k:
@@ -1195,9 +1190,8 @@ def w4a8_int8_linear(
 
     # The layout allows any ConvRot group that divides K; INT8 G=256 can spill to
     # global memory when K exceeds the fused LDS budget. int8_linear applies the
-    # same test before its own fast path. 6-bit rows have no HIP decode kernel yet,
-    # so they take the eager decode into the same INT8 GEMM.
-    if bits != 4 or not _convrot_supported(
+    # same test before its own fast path.
+    if not _convrot_supported(
         x.shape[-1], convrot_groupsize, x.device, x.dtype, int8_global_spill=True
     ):
         int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)

@@ -39,10 +39,11 @@ void launch_int8_gemm_kernel(const void* a, const void* b, void* c, const void* 
                              hipStream_t stream);
 
 // scale_code is a DTYPE_TO_CODE value: 0 float32, 5 e4m3 (passed as raw bytes).
-// codebook is 16 floats, or null for the uniform levels.
+// codebook is 16 floats, or null for the uniform levels. bits is 4 or 6.
 void launch_dequant_int4_grouped_to_int8_kernel(const void* qw, const void* s_rel, int scale_code,
                                                 const void* codebook, void* out, int64_t n,
-                                                int64_t k, int group_size, hipStream_t stream);
+                                                int64_t k, int group_size, int bits,
+                                                hipStream_t stream);
 
 // in_dtype_code is a DTYPE_TO_CODE value: 0 float32, 1 float16, 2 bfloat16.
 // s_rel is written as raw e4m3 bytes; seed is ignored unless stochastic is set.
@@ -58,8 +59,8 @@ void launch_w4a8_int8_gemm_chunked_kernel(const void* xq, const void* qw, const 
                                           int scale_code, const void* codebook,
                                           const void* s_channel, const void* xs, const void* bias,
                                           int bias_code, void* workspace, void* out, int M, int N,
-                                          int K, int group_size, int chunk_cols, int out_code,
-                                          hipStream_t stream);
+                                          int K, int group_size, int chunk_cols, int bits,
+                                          int out_code, hipStream_t stream);
 
 // Sol-Attn sparse attention -- see sage_attention/sol_attn.hip. The whole pipeline
 // runs over one caller-allocated workspace whose carve-up sol_attn_plan reports.
