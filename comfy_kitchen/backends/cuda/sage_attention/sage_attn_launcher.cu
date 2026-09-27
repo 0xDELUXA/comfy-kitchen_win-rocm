@@ -169,22 +169,20 @@ extern "C" void launch_sage_attn_kernel(
     LAUNCH_Q(HD, CK, MaskMode::kPreparedKey, nv_bfloat16, true, CQ);             \
   }
 
-  // Limit the smaller query tile to the measured image-size region.
-  // Other shapes retain the existing attention dispatch.
+  // Keep smaller unmasked query tiles limited to Blackwell image shapes.
+  // Ada retains 128-query tiles: warmed ComfyUI workloads regress with the
+  // smaller tiles under stock-clock thermal throttling.
   if (mask == nullptr && head_dim == 128 && cta_k == 128 &&
-      qo_len >= 4096 && qo_len <= 16896 && kv_len >= 4096 && kv_len <= 16896) {
-    int device = 0, major = 0, minor = 0;
+      qo_len >= 4096 && qo_len <= 4608 && kv_len >= 4096 && kv_len <= 4608 &&
+      num_qo_heads <= 32) {
+    int device = 0, major = 0;
     cudaError_t error = cudaGetDevice(&device);
     if (error == cudaSuccess)
       error = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
-    if (error == cudaSuccess)
-      error = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
     if (error != cudaSuccess)
       throw std::runtime_error(std::string("sage_attn device query failed: ") +
                                cudaGetErrorString(error));
-    const bool smaller_tile = (major == 8 && minor == 9) ||
-        (major == 12 && qo_len <= 4608 && kv_len <= 4608 && num_qo_heads <= 32);
-    if (smaller_tile) {
+    if (major == 12) {
       if (output_dtype_code == 1) {
         LAUNCH_Q(128, 128, MaskMode::kNone, half, true, 64);
       } else {
