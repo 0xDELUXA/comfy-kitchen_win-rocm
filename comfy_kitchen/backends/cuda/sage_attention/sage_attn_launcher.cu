@@ -175,20 +175,37 @@ extern "C" void launch_sage_attn_kernel(
   if (mask == nullptr && head_dim == 128 && cta_k == 128 &&
       qo_len >= 4096 && qo_len <= 4608 && kv_len >= 4096 && kv_len <= 4608 &&
       num_qo_heads <= 32) {
-    int device = 0, major = 0;
+    int device = 0, major = 0, multiprocessors = 0;
     cudaError_t error = cudaGetDevice(&device);
     if (error == cudaSuccess)
       error = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+    if (error == cudaSuccess && major == 12 && num_qo_heads >= 30)
+      error = cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, device);
     if (error != cudaSuccess)
       throw std::runtime_error(std::string("sage_attn device query failed: ") +
                                cudaGetErrorString(error));
     if (major == 12) {
-      if (output_dtype_code == 1) {
-        LAUNCH_Q(128, 128, MaskMode::kNone, half, true, 64);
-      } else {
-        LAUNCH_Q(128, 128, MaskMode::kNone, nv_bfloat16, true, 64);
+      bool smaller_tile = true;
+      if (num_qo_heads >= 30) {
+        // At 30-32 heads, use smaller tiles only when they save an SM-sized
+        // round of query work. Ming's 4422 queries otherwise lose to 128-row
+        // tiles, while Qwen's 4096/4608-query shapes retain the smaller tile.
+        // Keep the existing selection for smaller head counts.
+        const int64_t batch_heads = static_cast<int64_t>(batch_size) * num_qo_heads;
+        const int64_t blocks_64 = batch_heads * div_ceil(qo_len, 64);
+        const int64_t blocks_128 = batch_heads * div_ceil(qo_len, 128);
+        const int64_t rounds_64 = (blocks_64 + multiprocessors - 1) / multiprocessors;
+        const int64_t rounds_128 = (blocks_128 + multiprocessors - 1) / multiprocessors;
+        smaller_tile = rounds_64 < 2 * rounds_128;
       }
-      return;
+      if (smaller_tile) {
+        if (output_dtype_code == 1) {
+          LAUNCH_Q(128, 128, MaskMode::kNone, half, true, 64);
+        } else {
+          LAUNCH_Q(128, 128, MaskMode::kNone, nv_bfloat16, true, 64);
+        }
+        return;
+      }
     }
   }
 
