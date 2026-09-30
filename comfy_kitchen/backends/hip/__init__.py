@@ -1067,7 +1067,7 @@ def _fused_quantize_wxa8(
             bits,
             group_size,
             stochastic_rounding > 0,
-            int(stochastic_rounding),
+            int(stochastic_rounding) if stochastic_rounding > 0 else 0,
             _stream(weight),
         )
     return packed, s_rel, s_channel, None, (cb if bits == 4 else None)
