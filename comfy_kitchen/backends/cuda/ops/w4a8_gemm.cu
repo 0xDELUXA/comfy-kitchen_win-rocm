@@ -221,6 +221,7 @@ extern "C" bool launch_w4a8_codebook_gemm_chunked(
 // f32 s_channel. Same math as the eager quantizer, up to fp32 rounding order.
 namespace {
 
+__device__ __forceinline__ float rq_to_float(float v) { return v; }
 __device__ __forceinline__ float rq_to_float(__half v) { return __half2float(v); }
 __device__ __forceinline__ float rq_to_float(__nv_bfloat16 v) { return __bfloat162float(v); }
 template <typename T> __device__ __forceinline__ T rq_from_float(float v);
@@ -570,7 +571,10 @@ bool launch_wxa8_fused(const void* weight, const float* codebook, void* packed, 
                        int64_t N, int64_t K, int in_dtype_code, bool stochastic, uint64_t seed, cudaStream_t stream)
 {
     const bool wide = K > (BITS == 4 ? 16384 : 8192);   // long rows: one block per SM anyway, use more warps
-    const int threads = wide ? 512 : 256;
+    // Short W4 rows have at most 128 quantization groups. Avoid reserving
+    // eight warps per row when most of them cannot contribute to quantization.
+    const int threads = (BITS == 4 && K <= 2048) ? ((static_cast<int>(K / G) + 31) / 32) * 32
+                                               : (wide ? 512 : 256);
     const size_t shmem = (K / G) * sizeof(float) + (static_cast<size_t>(K) + 2 * (K / G)) * 2;   // group steps + 16-bit padded row
     int dev = 0, max_shmem = 0;
     if (cudaGetDevice(&dev) != cudaSuccess) return false;
@@ -591,7 +595,7 @@ bool launch_wxa8_fused(const void* weight, const float* codebook, void* packed, 
         return true;
     };
     bool ok;
-    if (in_dtype_code == 0) return false;   // fp32 weights: eager
+    if (in_dtype_code == 0) return false;   // fp32 weights use staged requantization
     if (in_dtype_code == 1) ok = run(static_cast<__half*>(nullptr));
     else ok = run(static_cast<__nv_bfloat16*>(nullptr));
     if (!ok) return false;
@@ -613,6 +617,156 @@ extern "C" bool launch_quantize_wxa8_convrot_fused(
     if (bits == 6 && G == 32) return launch_wxa8_fused<6, 32>(weight, nullptr, packed, s_rel, s_channel, N, K, in_dtype_code, stochastic, seed, stream);
     if (bits == 6 && G == 64) return launch_wxa8_fused<6, 64>(weight, nullptr, packed, s_rel, s_channel, N, K, in_dtype_code, stochastic, seed, stream);
     return false;
+}
+
+// Staged W4A8 requant for FP32 and rows too wide for the fused rotated-row buffer.
+// Only group scales occupy shared memory; ConvRot runs separately in bounded row chunks.
+namespace {
+
+// nearest index in cb[16] (lowest index on tie); cb sorted ascending
+__device__ __forceinline__ int rq_nearest(float x, const float* cb) {
+    int best = 0; float bd = fabsf(x - cb[0]);
+    #pragma unroll
+    for (int j = 1; j < 16; ++j) { float d = fabsf(x - cb[j]); if (d < bd) { bd = d; best = j; } }
+    return best;
+}
+
+template <typename InputType, bool STOCHASTIC>
+__global__ void quantize_w4a8_convrot_kernel(
+    const InputType* __restrict__ rotated,  // [N, K]
+    const float* __restrict__ codebook,     // [16]
+    int8_t* __restrict__ packed,            // [N, K/2]
+    uint8_t* __restrict__ s_rel,            // [N, K/16] e4m3 bits
+    float* __restrict__ s_channel,          // [N]
+    int K, uint64_t seed)
+{
+    constexpr int G = 16;
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int groups = K / G;
+    const int64_t row_off = static_cast<int64_t>(row) * K;
+
+    __shared__ float cb[16];
+    __shared__ float warp_max[32];
+    extern __shared__ float gscale[];  // [groups]
+    if (tid < 16) cb[tid] = codebook[tid];
+    __syncthreads();
+
+    // --- Phase 1: per-group ALS group scale; accumulate row shifted-amax ---
+    float thr_amax = 0.0f;
+    for (int g = tid; g < groups; g += nthreads) {
+        const int64_t base = row_off + static_cast<int64_t>(g) * G;
+        float w[G];
+        float amax = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < G; ++i) { w[i] = rq_to_float(rotated[base + i]); amax = fmaxf(amax, fabsf(w[i])); }
+        float gs = fmaxf(amax, 1e-8f);
+        int idx[G];
+        #pragma unroll
+        for (int i = 0; i < G; ++i) idx[i] = rq_nearest(w[i] / gs, cb);
+        #pragma unroll
+        for (int it = 0; it < 2; ++it) {       // matches eager _ALS_ITERS
+            float num = 0.0f, den = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < G; ++i) { float c = cb[idx[i]]; num += w[i] * c; den += c * c; }
+            gs = fmaxf(num / fmaxf(den, 1e-8f), 1e-8f);
+            #pragma unroll
+            for (int i = 0; i < G; ++i) idx[i] = rq_nearest(w[i] / gs, cb);
+        }
+        gscale[g] = gs;
+        #pragma unroll
+        for (int i = 0; i < G; ++i) thr_amax = fmaxf(thr_amax, fabsf(cb[idx[i]] * gs));
+    }
+
+    // --- block reduce thr_amax -> s_channel = row_amax / 127 ---
+    float wm = rq_warp_max(thr_amax);
+    const int lane = tid & 31, wid = tid >> 5;
+    if (lane == 0) warp_max[wid] = wm;
+    __syncthreads();
+    if (wid == 0) {
+        const int nwarps = (nthreads + 31) >> 5;
+        float t = (lane < nwarps) ? warp_max[lane] : 0.0f;
+        t = rq_warp_max(t);
+        if (lane == 0) warp_max[0] = t;
+    }
+    __syncthreads();
+    const float sc = fmaxf(warp_max[0] / 127.0f, 1e-8f);
+    if (tid == 0) s_channel[row] = sc;
+
+    // --- Phase 2: s_rel (fp8) -> int8 levels -> assign (+SR) -> pack ---
+    const int64_t prow_off = static_cast<int64_t>(row) * (K / 2);
+    const int64_t srow_off = static_cast<int64_t>(row) * groups;
+    for (int g = tid; g < groups; g += nthreads) {
+        const float gs = gscale[g];
+        const float srel_f = gs / sc;
+        const uint8_t srel_bits = __nv_cvt_float_to_fp8(srel_f, __NV_SATFINITE, __NV_E4M3);
+        s_rel[srow_off + g] = srel_bits;
+        const float srel_r = __half2float(__nv_cvt_fp8_to_halfraw(srel_bits, __NV_E4M3));
+        float lv[16];
+        #pragma unroll
+        for (int j = 0; j < 16; ++j) lv[j] = fminf(127.0f, fmaxf(-127.0f, nearbyintf(cb[j] * srel_r)));
+        const int64_t base = row_off + static_cast<int64_t>(g) * G;
+        int u[G];
+        #pragma unroll
+        for (int i = 0; i < G; ++i) {
+            const float t = rq_to_float(rotated[base + i]) / sc;
+            int a;
+            if constexpr (STOCHASTIC) {
+                int lo = 0;
+                #pragma unroll
+                for (int j = 0; j < 16; ++j) lo += (lv[j] <= t);
+                lo = min(max(lo - 1, 0), 14);
+                const float thr = lv[lo] + rq_uniform(base + i, seed) * (lv[lo + 1] - lv[lo]);
+                a = min(lo + (t > thr ? 1 : 0), 15);
+            } else {
+                a = rq_nearest(t, lv);
+            }
+            u[i] = a;
+        }
+        const int64_t base_p = prow_off + static_cast<int64_t>(g) * (G / 2);
+        #pragma unroll
+        for (int p = 0; p < G / 2; ++p)
+            packed[base_p + p] = static_cast<int8_t>((u[2 * p] & 0xF) | ((u[2 * p + 1] & 0xF) << 4));
+    }
+}
+
+}  // namespace
+
+// rotated: [N,K] in in_dtype (0=fp32,1=fp16,2=bf16); s_rel: [N,K/16] e4m3 bits (uint8).
+// Returns false (caller must fall back / raise) if the group-scale shared memory won't fit
+// or the launch is rejected, so uninitialized outputs are never mistaken for a result.
+extern "C" bool launch_quantize_w4a8_convrot(
+    const void* rotated, const void* codebook, void* packed, void* s_rel, void* s_channel,
+    int64_t N, int64_t K, int in_dtype_code, bool stochastic, uint64_t seed, cudaStream_t stream)
+{
+    const int threads = 256;
+    const size_t shmem = static_cast<size_t>(K / 16) * sizeof(float);
+    // Static shared is cb[16] + warp_max[32] = 192 bytes; bail if static+dynamic won't fit.
+    int dev = 0, max_shmem = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (cudaDeviceGetAttribute(&max_shmem, cudaDevAttrMaxSharedMemoryPerBlock, dev) != cudaSuccess)
+        return false;
+    if (shmem + 192 > static_cast<size_t>(max_shmem)) return false;
+    dim3 grid(static_cast<unsigned>(N));
+#define RQ_LAUNCH(IT)                                                                              \
+    do {                                                                                           \
+        if (stochastic)                                                                            \
+            quantize_w4a8_convrot_kernel<IT, true><<<grid, threads, shmem, stream>>>(              \
+                static_cast<const IT*>(rotated), static_cast<const float*>(codebook),              \
+                static_cast<int8_t*>(packed), static_cast<uint8_t*>(s_rel),                        \
+                static_cast<float*>(s_channel), static_cast<int>(K), seed);                        \
+        else                                                                                       \
+            quantize_w4a8_convrot_kernel<IT, false><<<grid, threads, shmem, stream>>>(             \
+                static_cast<const IT*>(rotated), static_cast<const float*>(codebook),              \
+                static_cast<int8_t*>(packed), static_cast<uint8_t*>(s_rel),                        \
+                static_cast<float*>(s_channel), static_cast<int>(K), 0);                           \
+    } while (0)
+    if (in_dtype_code == 0) RQ_LAUNCH(float);
+    else if (in_dtype_code == 1) RQ_LAUNCH(__half);
+    else RQ_LAUNCH(__nv_bfloat16);
+#undef RQ_LAUNCH
+    return cudaGetLastError() == cudaSuccess;
 }
 
 // Fused W4A8 GEMV for decode (M<=8): dequantize int4+codebook in registers and
