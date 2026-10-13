@@ -72,6 +72,7 @@ __all__ = [
     "fp16_linear",
     "int8_linear",
     "w4a8_int8_linear",
+    "w4a8_packed_linear",
     "int4_linear",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
@@ -214,6 +215,7 @@ from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     validate_w4a8_operands,
     validate_w4a8_weight_shape,
 )
+from comfy_kitchen.tensor.w4a8_packed import _FIXED_LUT, _mma_bits, w4a8_mma_record_bytes  # noqa: E402
 from comfy_kitchen.backends.eager.w4a8_int8 import (  # noqa: E402
     w4a8_int8_linear as eager_w4a8_int8_linear,
 )
@@ -227,6 +229,7 @@ from comfy_kitchen.constraints import (  # noqa: E402
     na3d_common_call_rule,
     sol_attn_common_call_rule,
     with_out_param,
+    with_w4a8_packed_storage,
 )
 from comfy_kitchen.float_utils import roundup  # noqa: E402
 from comfy_kitchen.registry import registry  # noqa: E402
@@ -251,6 +254,29 @@ _FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBA
 _INT4_PACKED_WEIGHT_SMALL_M_MAX = 8
 _INT4_INT8_WEIGHT_CHUNK_N = max(1, int(os.environ.get("COMFY_KITCHEN_INT4_INT8_WEIGHT_CHUNK_N", "4096")))
 _W4A8_CHUNKED = os.environ.get("COMFY_KITCHEN_W4A8_CHUNKED", "1") != "0"
+_W4A8_FIXED_DECODE_LUTS: dict[torch.device, torch.Tensor] = {}
+
+
+def _w4a8_fixed_decode_lut(device: torch.device) -> torch.Tensor:
+    if (decode_lut := _W4A8_FIXED_DECODE_LUTS.get(device)) is None:
+        codebook = torch.tensor(_FIXED_LUT, dtype=torch.float32)
+        scales = torch.arange(256, dtype=torch.uint8)
+        scales = scales.view(torch.float8_e4m3fn).float()
+        table = (
+            (scales[:, None] * codebook[None, :])
+            .round_()
+            .clamp_(-127, 127)
+            .to(torch.int8)
+            .contiguous()
+        )
+        # The immutable table outlives each capture; finish its copy before another
+        # stream can read it, and keep it outside execution-scoped allocations.
+        with allocation_context():
+            decode_lut = table.to(device)
+        _W4A8_FIXED_DECODE_LUTS[device] = decode_lut
+    return decode_lut
+
+
 _NVIDIA_16_SERIES = (
     "1660",
     "1650",
@@ -2031,6 +2057,57 @@ def fp16_linear(
     return out if len(orig_shape) == 2 else out.reshape(*orig_shape[:-1], n)
 
 
+def _w4a8_cluster_quantizer_ok(k: int, input_act: str | None, device: torch.device) -> bool:
+    """Whether the single-launch ConvRot quantizer of the streamed W4A8 decode (sm_90
+    clusters, at most four passes of 8 x 8 groups) covers act(x) for a K-wide row."""
+    return (
+        device.type == "cuda"
+        and input_act in (None, "swiglu", "rms_norm")
+        and k % 256 == 0
+        and k <= 256 * 8 * 8 * 4
+        and _cuda_device_capability(device.index)[0] >= 9
+    )
+
+
+def _w4a8_mma_linear(
+    x_2d, rotated, partial_absmax, act_weight, input_act_eps, input_act, xq, xs,
+    qdata, s_channel, bias_float, resid_2d, resid_scale, out,
+    convrot_groupsize, group_size, output_dtype_code, stream_ptr,
+):
+    """Quantize x_2d and run the streamed MMA GEMM into out."""
+    m, n = out.shape
+    # Call-local split-K sums and counters also isolate independently replayed graphs.
+    scratch = torch.zeros(m * n + n // 16, dtype=torch.int32, device=out.device)
+    workspace, counters = scratch[:m * n].view(m, n), scratch[m * n:]
+    bits = _mma_bits(qdata.numel(), n, xq.shape[1])
+    decode_lut = _w4a8_fixed_decode_lut(qdata.device) if bits == 4 else None
+    used = _C.w4a8_codebook_mma_linear(
+        _wrap_for_dlpack(x_2d),
+        _wrap_for_dlpack(rotated) if rotated is not None else None,
+        _wrap_for_dlpack(partial_absmax) if partial_absmax is not None else None,
+        _wrap_for_dlpack(act_weight) if act_weight is not None else None,
+        float(input_act_eps),
+        _input_act_code(input_act),
+        _wrap_for_dlpack(xq),
+        _wrap_for_dlpack(qdata),
+        _wrap_for_dlpack(decode_lut) if decode_lut is not None else None,
+        _wrap_for_dlpack(s_channel),
+        _wrap_for_dlpack(xs),
+        _wrap_for_dlpack(bias_float) if bias_float is not None else None,
+        _wrap_for_dlpack(resid_2d) if resid_2d is not None else None,
+        _wrap_for_dlpack(resid_scale) if resid_scale is not None else None,
+        _wrap_for_dlpack(workspace),
+        _wrap_for_dlpack(counters),
+        _wrap_for_dlpack(out),
+        convrot_groupsize,
+        group_size,
+        output_dtype_code,
+        stream_ptr,
+    )
+    if not used:
+        raise RuntimeError("MMA-packed W4A8 weight is unsupported on this device")
+
+
 def _act_weight_arg(input_act, input_act_weight, device, dtype: torch.dtype) -> torch.Tensor:
     """The fused quantizer's act-weight operand: the norm weight for acts
     that carry one, the empty placeholder otherwise."""
@@ -2393,6 +2470,23 @@ def dequantize_w4a8_int8_weight(
     return rotate_int8_convrot_weight(weight_rotated.contiguous(), convrot_groupsize).to(output_dtype)
 
 
+def pack_w4a8_mma_weight_(dest: torch.Tensor, s_rel: torch.Tensor):
+    """Canonical codes at dest's start -> packed records in the same storage.
+
+    Scratch is the saved group scales plus one 16-row slab. All work runs on
+    the caller's stream; the output keeps slab/K order without a global permutation.
+    """
+    n, groups = s_rel.shape
+    k = groups * 16
+    bits = 4 if dest.numel() == n * k * 9 // 16 else 6
+    scales = s_rel.view(torch.uint8).clone()
+    scratch = torch.empty(2 * k * bits, dtype=torch.uint8, device=dest.device)
+    _C.pack_w4a8_mma_inplace(
+        _wrap_for_dlpack(dest), _wrap_for_dlpack(scales), _wrap_for_dlpack(scratch),
+        torch.cuda.current_stream(dest.device).cuda_stream,
+    )
+
+
 def w4a8_int8_linear(
     x: torch.Tensor,
     qdata: torch.Tensor,
@@ -2404,8 +2498,24 @@ def w4a8_int8_linear(
     group_size: int = 16,
     convrot_groupsize: int = 256,
     out_dtype: torch.dtype = torch.bfloat16,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """CUDA W4A8/W6A8 linear using chunked INT4/INT6 decode and the tuned INT8 GEMM."""
+    if residual is not None:
+        return _apply_residual(
+            w4a8_int8_linear(
+                x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
+                convrot_groupsize, out_dtype, input_act, input_act_weight,
+                input_act_eps,
+            ),
+            residual,
+            residual_scale,
+        )
+    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
     n, k, _bits = validate_w4a8_operands(
         qdata,
         s_rel,
@@ -2466,80 +2576,10 @@ def w4a8_int8_linear(
         and s_rel.dtype == torch.float8_e4m3fn
     )
     if chunked:
-        chunk_cols = _w4a8_weight_chunk_cols(m, n, x.get_device())
-        workspace = torch.empty(
-            min(chunk_cols, n), k, dtype=torch.int8, device=x.device
+        used, xq, xs = _w4a8_linear_chunked(
+            x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
+            convrot_groupsize, group_size, False,
         )
-        # Quantize the activation with the same 64-lane ConvRot kernel int8_linear uses
-        # (~2x faster than the one inside the fused binding); at small M the extra launch
-        # costs more than it saves.
-        fast_act = (
-            m >= 512
-            and convrot_groupsize == 256
-            and k % 256 == 0
-            and 256 <= k <= _CONVROT_FUSED_MAX_K
-            and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
-        )
-        if fast_act:
-            xq, xs = quantize_int8_rowwise_convrot64(x_2d, convrot_groupsize)
-            used = _C.w4a8_codebook_gemm_chunked(
-                _wrap_for_dlpack(xq),
-                _wrap_for_dlpack(qdata),
-                _wrap_for_dlpack(s_rel.view(torch.uint8)),
-                wrap_codebook(),
-                _wrap_for_dlpack(s_channel),
-                _wrap_for_dlpack(xs.reshape(m)),
-                _wrap_for_dlpack(bias_arg) if bias_arg is not None else None,
-                _wrap_for_dlpack(workspace),
-                _wrap_for_dlpack(out),
-                group_size,
-                chunk_cols,
-                output_dtype_code,
-                stream_ptr,
-            )
-        elif hasattr(_C, "w4a8_codebook_linear_chunked"):
-            used = _C.w4a8_codebook_linear_chunked(
-                _wrap_for_dlpack(x_2d),
-                _wrap_for_dlpack(xq),
-                _wrap_for_dlpack(xs),
-                _wrap_for_dlpack(qdata),
-                _wrap_for_dlpack(s_rel.view(torch.uint8)),
-                wrap_codebook(),
-                _wrap_for_dlpack(s_channel),
-                _wrap_for_dlpack(bias_arg) if bias_arg is not None else None,
-                _wrap_for_dlpack(workspace),
-                _wrap_for_dlpack(out),
-                convrot_groupsize,
-                group_size,
-                chunk_cols,
-                output_dtype_code,
-                stream_ptr,
-            )
-        else:
-            _C.quantize_int8_rowwise_convrot(
-                _wrap_for_dlpack(x_2d),
-                _wrap_for_dlpack(xq),
-                _wrap_for_dlpack(xs),
-                convrot_groupsize,
-                False,
-                0,
-                stream_ptr,
-            )
-            used = _C.w4a8_codebook_gemm_chunked(
-                _wrap_for_dlpack(xq),
-                _wrap_for_dlpack(qdata),
-                _wrap_for_dlpack(s_rel.view(torch.uint8)),
-                wrap_codebook(),
-                _wrap_for_dlpack(s_channel),
-                _wrap_for_dlpack(xs.reshape(m)),
-                _wrap_for_dlpack(bias_arg) if bias_arg is not None else None,
-                _wrap_for_dlpack(workspace),
-                _wrap_for_dlpack(out),
-                group_size,
-                chunk_cols,
-                output_dtype_code,
-                stream_ptr,
-            )
         if used:
             return out.reshape(*x.shape[:-1], n)
     else:
@@ -2584,6 +2624,167 @@ def w4a8_int8_linear(
         sx = sx * xs.to(out_dtype)
         out.addmm_(sx, correction.to(out_dtype))
     return out.reshape(*x.shape[:-1], n)
+
+
+def w4a8_packed_linear(
+    x: torch.Tensor,
+    qdata: torch.Tensor,
+    s_rel: torch.Tensor,
+    s_channel: torch.Tensor,
+    codebook: torch.Tensor | None = None,
+    correction: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    group_size: int = 16,
+    convrot_groupsize: int = 256,
+    out_dtype: torch.dtype = torch.bfloat16,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Resident packed W4A8/W6A8: small-M MMA or direct packed dequantization for prefill."""
+    if input_act in (None, "none"):
+        input_act = None
+    if residual is not None and residual_scale is None:
+        raise ValueError("w4a8_int8_linear: residual requires residual_scale")
+    n = s_channel.numel()
+    k = x.shape[-1] // _input_act_width(input_act)
+    fuse_act = (
+        input_act is not None
+        and x.numel() <= 8 * x.shape[-1]
+        and _w4a8_cluster_quantizer_ok(k, input_act, x.device)
+    )
+    if input_act is not None and not fuse_act:
+        x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+        input_act = None
+    if (
+        qdata.dim() != 1
+        or qdata.dtype != torch.int8
+        or n % 16
+        or qdata.numel() not in (n * k * w4a8_mma_record_bytes(4) // 512, n * k * w4a8_mma_record_bytes(6) // 512)
+        or s_rel.numel() != 0
+        or group_size != 16
+        or correction is not None
+    ):
+        raise ValueError("invalid MMA-packed W4A8 operands")
+    x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+    m = x_2d.shape[0]
+    if residual is not None and not (
+        m <= 8 and residual.numel() == m * n and residual_scale.numel() == n
+    ):
+        return _apply_residual(
+            w4a8_packed_linear(
+                x, qdata, s_rel, s_channel, codebook, correction, bias, group_size,
+                convrot_groupsize, out_dtype, input_act, input_act_weight, input_act_eps,
+            ),
+            residual,
+            residual_scale,
+        )
+    xq = torch.empty(m, k, dtype=torch.int8, device=x.device)
+    xs = torch.empty(m, 1, dtype=torch.float32, device=x.device)
+    out = torch.empty(m, n, dtype=out_dtype, device=x.device)
+    if m <= 8:
+        # Staged-pair scratch is only needed where the single cluster quantizer
+        # cannot run (pre-sm_90, very wide K); a fused activation implies the cluster path.
+        rotated = partial_absmax = act_weight = None
+        if input_act is None and not _w4a8_cluster_quantizer_ok(k, None, x.device):
+            rotated = torch.empty_like(x_2d)
+            partial_absmax = torch.empty(
+                m, k // convrot_groupsize, dtype=torch.float32, device=x.device
+            )
+        if input_act == "rms_norm":
+            act_weight = _act_weight_arg(input_act, input_act_weight, x.device, x_2d.dtype)
+        resid_2d = resid_scale = None
+        if residual is not None:
+            resid_2d = residual.reshape(m, n).to(out_dtype).contiguous()
+            resid_scale = _gemm_vector_arg(residual_scale, x.device, out_dtype)
+        bias_float = bias.float().contiguous() if bias is not None else None
+        _w4a8_mma_linear(
+            x_2d, rotated, partial_absmax, act_weight, input_act_eps, input_act, xq, xs,
+            qdata, s_channel, bias_float, resid_2d, resid_scale, out,
+            convrot_groupsize, group_size, DTYPE_TO_CODE[out_dtype],
+            torch.cuda.current_stream(x.device).cuda_stream,
+        )
+    else:
+        bias_arg = _gemm_vector_arg(bias, x.device, out_dtype) if bias is not None else None
+        used, _, _ = _w4a8_linear_chunked(
+            x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
+            convrot_groupsize, group_size, True,
+        )
+        if not used:
+            raise RuntimeError("Packed W4A8 prefill is unsupported by the INT8 GEMM")
+    return out.reshape(*x.shape[:-1], n)
+
+
+def _w4a8_linear_chunked(
+    x_2d, qdata, s_rel, s_channel, codebook, bias_arg, xq, xs, out,
+    convrot_groupsize, group_size, mma_packed,
+):
+    """Shared bounded INT8 GEMM; the native dequantizer reads the selected storage format."""
+    m, k = x_2d.shape
+    n = s_channel.numel()
+    output_dtype_code = DTYPE_TO_CODE[out.dtype]
+    stream_ptr = torch.cuda.current_stream(x_2d.device).cuda_stream
+    chunk_cols = _w4a8_weight_chunk_cols(m, n, x_2d.get_device())
+    workspace = torch.empty(min(chunk_cols, n), k, dtype=torch.int8, device=x_2d.device)
+    # The 64-lane quantizer is faster at large M; at small M its extra launch costs more.
+    fast_act = (
+        m >= 512
+        and convrot_groupsize == 256
+        and k % 256 == 0
+        and 256 <= k <= _CONVROT_FUSED_MAX_K
+        and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
+    )
+    if fast_act:
+        xq, xs = quantize_int8_rowwise_convrot64(x_2d, convrot_groupsize)
+    elif hasattr(_C, "w4a8_codebook_linear_chunked"):
+        used = _C.w4a8_codebook_linear_chunked(
+            _wrap_for_dlpack(x_2d),
+            _wrap_for_dlpack(xq),
+            _wrap_for_dlpack(xs),
+            _wrap_for_dlpack(qdata),
+            _wrap_for_dlpack(s_rel.view(torch.uint8)),
+            _wrap_for_dlpack(codebook) if codebook is not None else None,
+            _wrap_for_dlpack(s_channel),
+            _wrap_for_dlpack(bias_arg) if bias_arg is not None else None,
+            _wrap_for_dlpack(workspace),
+            _wrap_for_dlpack(out),
+            convrot_groupsize,
+            group_size,
+            chunk_cols,
+            output_dtype_code,
+            stream_ptr,
+            mma_packed,
+        )
+        return used, xq, xs
+    else:
+        _C.quantize_int8_rowwise_convrot(
+            _wrap_for_dlpack(x_2d),
+            _wrap_for_dlpack(xq),
+            _wrap_for_dlpack(xs),
+            convrot_groupsize,
+            False,
+            0,
+            stream_ptr,
+        )
+    used = _C.w4a8_codebook_gemm_chunked(
+        _wrap_for_dlpack(xq),
+        _wrap_for_dlpack(qdata),
+        _wrap_for_dlpack(s_rel.view(torch.uint8)),
+        _wrap_for_dlpack(codebook) if codebook is not None else None,
+        _wrap_for_dlpack(s_channel),
+        _wrap_for_dlpack(xs.reshape(m)),
+        _wrap_for_dlpack(bias_arg) if bias_arg is not None else None,
+        _wrap_for_dlpack(workspace),
+        _wrap_for_dlpack(out),
+        group_size,
+        chunk_cols,
+        output_dtype_code,
+        stream_ptr,
+        mma_packed,
+    )
+    return used, xq, xs
 
 
 def na3d(
@@ -4921,6 +5122,7 @@ def _build_constraints() -> dict:
     for name in ("fp16_conv3d", "group_norm_silu_pad3d"):
         if name in constraints:
             constraints[name + "_out"] = with_out_param(constraints[name])
+    constraints["w4a8_packed_linear"] = with_w4a8_packed_storage(constraints["w4a8_int8_linear"])
     return constraints
 
 
@@ -4942,4 +5144,3 @@ def _register():
 
 
 _register()
-
