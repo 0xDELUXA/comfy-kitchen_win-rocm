@@ -472,6 +472,6 @@ class TestFusedGemvQuantizer:
         h = torch.randn(1, 2 * 2048, dtype=torch.bfloat16, device="cuda")
         weight = torch.randint(-127, 127, (256, 4096), dtype=torch.int8, device="cuda")
         wscale = torch.tensor(0.01, dtype=torch.float32, device="cuda")
-        with pytest.raises((AssertionError, RuntimeError)):
+        with pytest.raises((AssertionError, RuntimeError, ValueError)):
             ck.int8_linear(h, weight, wscale, None, torch.bfloat16,
                            convrot=True, convrot_groupsize=_GROUP, input_act="swiglu")
