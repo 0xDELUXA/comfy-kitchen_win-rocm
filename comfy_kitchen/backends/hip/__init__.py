@@ -66,6 +66,7 @@ __all__ = [
     "gemv_awq_w4a16",
     "group_norm_silu_pad3d",
     "group_norm_silu_pad3d_out",
+    "group_norm_stats3d",
     "quantize_svdquant_w4a4",
     "scaled_mm_svdquant_w4a4",
     "apply_rope",
@@ -1814,8 +1815,9 @@ def group_norm_silu_pad3d(
     stats: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-frame GroupNorm + SiLU + causal conv padding in one pass; the result is
-    channels_last_3d, like the CUDA kernel. Shapes it declines, and caller-supplied ``stats``,
-    run the eager op. ``out`` is written in place where the kernel can index it, else copied into."""
+    channels_last_3d, like the CUDA kernel. Shapes it declines run the eager op. ``stats`` from
+    group_norm_stats3d normalizes a row strip of a frame with that frame's statistics. ``out``
+    is written in place where the kernel can index it, else copied into."""
     b, c, t, h, w = x.shape
     left, right, top, bottom, front = pad
     if min(pad) < 0:
@@ -1830,15 +1832,19 @@ def group_norm_silu_pad3d(
                 else bias.to(device=x.device, dtype=x.dtype).contiguous())
     else:
         bias = None  # pad-only ignores bias, as eager and CUDA do
+    if stats is not None and (stats.shape, stats.dtype, stats.device) != ((b * t, num_groups, 2), torch.float32, x.device):
+        raise ValueError(f"group_norm_silu_pad3d: stats must be float32 [{b * t}, {num_groups}, 2] on {x.device}")
     # an empty frame still has a zero border to write, which the launcher skips
-    served = not (c % 8 or 256 % (c // 8) or h == 0 or w == 0
+    served = not (c % 8 or c > 2048 or h == 0 or w == 0
                   or (weight is not None and (c % num_groups or num_groups > 1024))
                   or (not zero_pad and (max(left, right) >= w or max(top, bottom) >= h))
-                  or b * (t + front) > 65535 or stats is not None)
-    if served:
+                  or b * (t + front) > 65535)
+    row_stride = _ndhwc_row_stride(x) if served else None
+    if served and row_stride is None:
+        row_stride = w * c
         x = x.contiguous(memory_format=torch.channels_last_3d)
-        # the kernel loads whole 16-byte registers; a misaligned view takes eager, as on CUDA
-        served = x.data_ptr() % 16 == 0
+    # the kernel loads whole 16-byte registers; a misaligned view takes eager, as on CUDA
+    served = served and x.data_ptr() % 16 == 0
     if not served:
         res = _eager.group_norm_silu_pad3d(x, weight, bias, num_groups, eps, pad, silu, zero_pad, stats)
         if out is None:
@@ -1854,20 +1860,55 @@ def group_norm_silu_pad3d(
         dst = torch.empty(oshape, dtype=x.dtype, device=x.device,
                           memory_format=torch.channels_last_3d)
     workspace = None
-    if weight is not None:
+    if weight is None:
+        stats = None
+    elif stats is None:
         chunks = -(-(h * w) // 1024)
         workspace = torch.empty(2 * b * t * (chunks * c + num_groups), dtype=torch.float32,
                                 device=x.device)
+    else:
+        stats = stats.contiguous()
     _C.group_norm_silu_pad3d(
         _dl(x), None if weight is None else _dl(weight), None if bias is None else _dl(bias),
-        _dl(dst), None if workspace is None else _dl(workspace),
-        b, c, t, h, w, num_groups, eps, left, right, top, bottom, front, silu, zero_pad,
+        _dl(dst), None if workspace is None else _dl(workspace), None if stats is None else _dl(stats),
+        b, c, t, h, w, num_groups, eps, left, right, top, bottom, front, silu, zero_pad, row_stride,
         _stream(x),
     )
     if out is None or dst is out:
         return dst
     out.copy_(dst)
     return out
+
+
+def _ndhwc_row_stride(x: torch.Tensor):
+    """Elements between image rows when x is a single frame with packed NHWC rows that sit farther
+    apart than W * C (a row-interleaved view the kernels read in place); None otherwise."""
+    b, c, t, h, w = x.shape
+    if (t == 1 and x.stride(1) == 1 and x.stride(4) == c and x.stride(3) > w * c and x.stride(3) % 8 == 0
+            and (b == 1 or x.stride(0) == h * x.stride(3))):
+        return x.stride(3)
+    return None
+
+
+def group_norm_stats3d(x: torch.Tensor, num_groups: int, eps: float) -> torch.Tensor:
+    """Per-frame GroupNorm (mean, rstd) of x [B, C, T, H, W] as float32 [B*T, num_groups, 2],
+    the same statistics group_norm_silu_pad3d computes for itself."""
+    b, c, t, h, w = x.shape
+    served = not (c % 8 or c > 2048 or c % num_groups or num_groups > 1024 or b * t > 65535
+                  or h == 0 or w == 0)
+    row_stride = _ndhwc_row_stride(x) if served else None
+    if served and row_stride is None:
+        row_stride = w * c
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+    served = served and x.data_ptr() % 16 == 0
+    if not served:
+        return _eager.group_norm_stats3d(x, num_groups, eps)
+    chunks = -(-(h * w) // 1024)
+    workspace = torch.empty(2 * b * t * chunks * c, dtype=torch.float32, device=x.device)
+    stats = torch.empty((b * t, num_groups, 2), dtype=torch.float32, device=x.device)
+    _C.group_norm_stats3d(_dl(x), _dl(workspace), _dl(stats), b, c, t, h, w, num_groups, eps,
+                          row_stride, _stream(x))
+    return stats
 
 
 def _writes_packed_ndhwc(out: torch.Tensor) -> bool:
@@ -2810,6 +2851,15 @@ def _build_constraints(has_wmma: bool = True) -> dict:
                 ),
                 "bias": ParamConstraint(dtypes=frozenset({torch.float16, type(None)})),
                 "residual": ParamConstraint(dtypes=frozenset({torch.float16, type(None)})),
+            },
+            default_devices=dev,
+        ),
+        "group_norm_stats3d": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(5),),
+                ),
             },
             default_devices=dev,
         ),

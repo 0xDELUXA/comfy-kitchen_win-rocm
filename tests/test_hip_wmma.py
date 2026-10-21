@@ -526,8 +526,8 @@ def test_group_norm_silu_pad3d_fp32_affine_and_ncdhw_input(hip, monkeypatch):
 def test_group_norm_silu_pad3d_declined_shapes_fall_back(hip, case):
     torch.manual_seed(0)
     if case == "channels":
-        x, weight, bias = _gn_inputs(1, 96, 2, 12, 12, torch.float16)
-        groups = 32
+        x, weight, bias = _gn_inputs(1, 2056, 1, 4, 4, torch.float16)
+        groups = 8
     elif case == "groups":
         x, weight, bias = _gn_inputs(1, 2048, 1, 4, 4, torch.float16)
         groups = 2048
@@ -766,9 +766,9 @@ def test_group_norm_silu_pad3d_binding_rejects_negative_padding(hip, side):
     pads[side] = -2 if side == "front" else -4
     with pytest.raises(RuntimeError, match=f"{side} must be non-negative"):
         hip._C.group_norm_silu_pad3d(
-            hip._dl(x), None, None, hip._dl(out), None, 1, 8, 2, 4, 4, 1, 0.0,
+            hip._dl(x), None, None, hip._dl(out), None, None, 1, 8, 2, 4, 4, 1, 0.0,
             pads["left"], pads["right"], pads["top"], pads["bottom"], pads["front"], False, False,
-            hip._stream(x))
+            32, hip._stream(x))
 
 
 @needs_wmma
