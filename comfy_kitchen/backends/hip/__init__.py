@@ -739,21 +739,16 @@ def fp16_linear(
 _HIP_FUSED_ACTS = (None, "none", "gelu_tanh", "swiglu", "situ")
 
 
-def int8_linear(
+def _split_input_act(
     x: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-    convrot: bool = False,
-    convrot_groupsize: int = 256,
-    input_act: str | None = None,
-    input_act_weight: torch.Tensor | None = None,
-    input_act_eps: float = 0.0,
-    residual: torch.Tensor | None = None,
-    residual_scale: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """INT8 linear with dynamic row-wise activation quantization, on WMMA."""
+    input_act: str | None,
+    input_act_weight: torch.Tensor | None,
+    input_act_eps: float,
+    convrot: bool,
+    convrot_groupsize: int,
+) -> tuple[torch.Tensor, str | None, torch.Tensor | None]:
+    """Apply what the ConvRot quantizer cannot fuse; return the input, the act left
+    for the quantizer and the rms_norm weight operand it needs."""
     # Rejected here so every route fails the same way, not just the fused one.
     _input_act_code(input_act)
     act_weight = None
@@ -769,6 +764,26 @@ def int8_linear(
     if input_act not in _HIP_FUSED_ACTS and act_weight is None:
         x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
         input_act = None
+    return x, input_act, act_weight
+
+
+def int8_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    convrot: bool = False,
+    convrot_groupsize: int = 256,
+    input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """INT8 linear with dynamic row-wise activation quantization, on WMMA."""
+    x, input_act, act_weight = _split_input_act(
+        x, input_act, input_act_weight, input_act_eps, convrot, convrot_groupsize)
     # k_act is the activated (quantized) row width: swiglu and situ halve the raw row.
     in_width = _input_act_width(input_act)
     if x.shape[-1] % in_width != 0:
@@ -945,15 +960,18 @@ def _w4a8_int8_linear_chunked(
     group_size: int,
     convrot_groupsize: int,
     out_dtype: torch.dtype,
+    input_act: str | None = None,
+    act_weight: torch.Tensor | None = None,
+    act_eps: float = 0.0,
 ) -> torch.Tensor:
     n, k, _bits = _w4a8_geometry(qdata, s_rel, group_size)
     device = x.device
     orig_shape = x.shape
-    x2d = x.reshape(-1, k).contiguous()
+    x2d = x.reshape(-1, x.shape[-1]).contiguous()
     m = x2d.shape[0]
 
     # Rotated and quantized once: the chunk loop only walks the weight.
-    xq, xs = _rotate_quant_int8(x2d, convrot_groupsize)
+    xq, xs = _rotate_quant_int8(x2d, convrot_groupsize, input_act, act_weight, act_eps)
 
     scale_code = DTYPE_TO_CODE[s_rel.dtype]
     s_rel_arg = _operand(s_rel, device, "s_rel")
@@ -1257,12 +1275,23 @@ def w4a8_int8_linear(
             residual,
             residual_scale,
         )
-    x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+    x, input_act, act_weight = _split_input_act(
+        x, input_act, input_act_weight, input_act_eps, True, convrot_groupsize)
     _n, k, _bits = validate_w4a8_operands(
         qdata, s_rel, s_channel, codebook, correction, group_size, convrot_groupsize
     )
-    if x.shape[-1] != k:
+    if x.shape[-1] != k * _input_act_width(input_act):
         raise ValueError(f"Input K={x.shape[-1]} does not match qdata K={k}")
+    # The layout allows any ConvRot group that divides K; INT8 G=256 can spill to
+    # global memory when K exceeds the fused LDS budget. int8_linear applies the
+    # same test before its own fast path.
+    convrot_ok = _convrot_supported(
+        k, convrot_groupsize, x.device, x.dtype, int8_global_spill=True
+    )
+    # Only the HIP ConvRot quantizer absorbs the activation.
+    if correction is not None or not convrot_ok:
+        x = _apply_input_act(x, input_act, input_act_weight, input_act_eps)
+        input_act = None
 
     # The asymmetric zero-point correction is a rank-one term the INT8 epilogue
     # cannot express, so that layout runs off the dequantized weight instead.
@@ -1279,19 +1308,15 @@ def w4a8_int8_linear(
         )
         return torch.nn.functional.linear(x, weight, bias).to(out_dtype)
 
-    # The layout allows any ConvRot group that divides K; INT8 G=256 can spill to
-    # global memory when K exceeds the fused LDS budget. int8_linear applies the
-    # same test before its own fast path.
-    if not _convrot_supported(
-        x.shape[-1], convrot_groupsize, x.device, x.dtype, int8_global_spill=True
-    ):
+    if not convrot_ok:
         int8_weight = _dequant_int4_grouped_to_int8(qdata, s_rel, codebook, group_size)
         return _eager.int8_linear(
             x, int8_weight, s_channel, bias, out_dtype, True, convrot_groupsize
         )
 
     return _w4a8_int8_linear_chunked(
-        x, qdata, s_rel, s_channel, codebook, bias, group_size, convrot_groupsize, out_dtype
+        x, qdata, s_rel, s_channel, codebook, bias, group_size, convrot_groupsize, out_dtype,
+        input_act, act_weight, input_act_eps,
     )
 
 
